@@ -3,9 +3,9 @@
 # A template to copy, not a live workflow. Copy it into each module repository as
 # .github/workflows/pofix-review.yml, then replace the placeholders:
 #   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
-#   baca8a371dafadc55eea217da75002dac6f12163        the 40-hex commit of that repository to run pr-review.yml from
+#   0253f28eee97720499bdcace0202318e4184b156        the 40-hex commit of that repository to run pr-review.yml from
 #   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
-#   3c27e52cfbdb938891854e2ed5d85816c6c3787d          the 40-hex commit of the skills to run
+#   99c2eab9c5f66ae84fce8b40547edbee7375759c          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
 # which explains how to pin and upgrade both SHAs.
 #
@@ -32,9 +32,9 @@ jobs:
       contents: read
       pull-requests: read
       id-token: write
-    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@baca8a371dafadc55eea217da75002dac6f12163
+    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@0253f28eee97720499bdcace0202318e4184b156
     with:
       skills_repository: pofix/pofix-skills
-      skills_sha: 3c27e52cfbdb938891854e2ed5d85816c6c3787d
+      skills_sha: 99c2eab9c5f66ae84fce8b40547edbee7375759c
     secrets:
       POFIX_APP_PRIVATE_KEY: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
