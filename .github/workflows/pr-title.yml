@@ -11,6 +11,10 @@ jobs:
   main:
     name: Validate PR title
     runs-on: ubuntu-latest
+    # Pilot fork only: the organization keeps the default token read-only.
+    permissions:
+      pull-requests: read
+      statuses: write
     steps:
       # Please look up the latest version from
       # https://github.com/amannn/action-semantic-pull-request/releases
