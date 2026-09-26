@@ -6,12 +6,19 @@
 #
 # A maintainer comment containing "@pofix" on a pull request starts one run:
 #   gate   - checks the commenter and the inputs and pins the head. No secret, no App token.
+#   check-start - creates the check run `pofix review` on the pinned head, in progress,
+#            with an App token that can only write checks.
 #   verify - runs terraform init and validate on the head's examples, with no credential,
 #            and uploads the results as one JSON file.
 #   review - runs the terraform-module-pr-review skill render-only, with a read-only
 #            App token, and uploads comment.md and result.json as an artifact.
 #   post   - validates the artifact, re-reads the head, skips a duplicate, and posts one
-#            review with the event COMMENT, using a separate write token.
+#            review with the event COMMENT, using a separate write token, then completes
+#            the check run with a conclusion mapped from the verdict.
+#   check-finish - always runs once the check run exists, and completes it as neutral with
+#            the reason when post did not.
+# On an installation that has not granted the App the Checks permission, check-start fails
+# and shows red, the check jobs do nothing more, and the review is still posted.
 #
 # This file has no placeholder to fill. The action SHAs, the terraform-skill SHA, the
 # Terraform MCP server release checksum, the Terraform version and the apt versions are
@@ -117,6 +124,45 @@ jobs:
             echo "skills_sha=$SKILLS_SHA"
             echo "head_sha=$head_sha"
           } >> "$GITHUB_OUTPUT"
+
+  # The check run `pofix review` on the head the gate pinned, in progress while the review
+  # runs. Its token can write checks and nothing else. Nothing later needs this job to
+  # succeed: without a check run id the review and the post run as before, and post and
+  # check-finish skip the check. The id is digits or the job fails.
+  check-start:
+    needs: gate
+    if: needs.gate.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      check_run_id: ${{ steps.create.outputs.check_run_id }}
+    steps:
+      - name: Mint the checks token
+        id: check-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POFIX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      - name: Create the check run
+        id: create
+        env:
+          GH_TOKEN: ${{ steps.check-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          id="$(jq -n --arg head "$GATE_HEAD" --arg url "$RUN_URL" \
+            '{name: "pofix review", head_sha: $head, status: "in_progress", details_url: $url}' |
+            gh api --method POST "repos/$REPOSITORY/check-runs" --input - --jq '.id')"
+          [[ "$id" =~ ^[1-9][0-9]*$ ]] || fail "unexpected check run id"
+          echo "check_run_id=$id" >> "$GITHUB_OUTPUT"
 
   # The only job that runs anything the head controls: terraform init and validate on the
   # example directories the change touches, through the skill's verify-pass.sh. It holds no
@@ -314,8 +360,10 @@ jobs:
   # does, skips the review rather than posting without verification: the newer comment's
   # run does the review. The verify job timeout is only a backstop; a job that hits it ends
   # cancelled and would skip the review too. [verify]
+  # check-start is needed only for its output: the if: below has a status function, so a
+  # failed check-start does not skip the review.
   review:
-    needs: [gate, verify]
+    needs: [gate, check-start, verify]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.verify.result != 'cancelled' && needs.verify.outputs.head_moved != 'true' }}
     outputs:
       artifact_id: ${{ steps.upload-review.outputs.artifact-id }}
@@ -508,7 +556,9 @@ jobs:
         with:
           use_bedrock: true
           github_token: ${{ steps.read-token.outputs.token }}
-          # The prompt is built from the gate outputs and the output directory only.
+          # The prompt is built from the gate outputs, the output directory and the App slug
+          # only. The last line names the host's own check, so the skill does not read it as
+          # a signal about the change.
           prompt: |
             Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
             The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
@@ -516,6 +566,7 @@ jobs:
             Output directory: ${{ runner.temp }}/pofix-out
             ${{ needs.verify.result == 'success' && format('Verification results file: {0}/pofix-verify/verify.json', runner.temp) || 'Verification did not run: there is no verification results file. Record every example check as not run.' }}
             No AWS profile is named for this run, so the plan pass does not run.
+            ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
           # docs. The Read deny rules apply to Read and, best effort, to Glob and Grep; the
@@ -645,12 +696,17 @@ jobs:
 
   # Explicit, because a failed verify job upstream of review would otherwise skip post
   # through the default success() check.
+  # check-start is needed only for the check run id; a failed check-start leaves it empty,
+  # and the review is still posted.
   post:
-    needs: [gate, review]
+    needs: [gate, check-start, review]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.review.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions: {}
+    outputs:
+      posted_url: ${{ steps.post.outputs.review_url }}
+      already_posted_url: ${{ steps.post.outputs.already_posted_url }}
     concurrency:
       group: pofix-post-${{ github.repository }}-${{ github.event.comment.id }}
       cancel-in-progress: false
@@ -696,7 +752,12 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-pull-requests: write
 
+      # Both URLs are set only after the head re-check passed. review_url, when this step
+      # posts the review, is the one the check run is completed with. already_posted_url,
+      # when the dedupe finds a review an earlier run posted, is left to check-finish: this
+      # run's verdict may differ from the one that review carries.
       - name: Post the review
+        id: post
         env:
           GH_TOKEN: ${{ steps.write-token.outputs.token }}
           IN: ${{ runner.temp }}/pofix-in
@@ -731,8 +792,11 @@ jobs:
           # Read first, so an API error stops the job instead of passing as "not posted".
           reviews="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews")"
           bodies="$(jq -r --arg bot "$APP_BOT" '.[] | select(.user.login == $bot) | .body' <<< "$reviews")"
+          posted="$(jq -rn --arg bot "$APP_BOT" --arg m "$marker" \
+            '[inputs[] | select(.user.login == $bot and ((.body // "") | contains($m))) | .html_url] | first // empty' <<< "$reviews")"
           if grep -qF -- "$marker" <<< "$bodies"; then
             echo "::notice::a review for comment $COMMENT_ID is already posted; nothing posted"
+            echo "already_posted_url=$posted" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
@@ -763,5 +827,115 @@ jobs:
           fi
 
           # commit_id binds the review to the head checked above.
-          jq -n --rawfile body "$body" --arg head "$head_sha" '{body: $body, event: "COMMENT", commit_id: $head}' |
-            gh api --method POST "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" --input - --jq '.html_url'
+          posted="$(jq -n --rawfile body "$body" --arg head "$head_sha" '{body: $body, event: "COMMENT", commit_id: $head}' |
+            gh api --method POST "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" --input - --jq '.html_url')"
+          echo "$posted"
+          echo "review_url=$posted" >> "$GITHUB_OUTPUT"
+
+      # A token of its own, so the write token keeps pull-requests write only. If this
+      # mint or the completion fails, the review is already posted: the job stays green
+      # and check-finish completes the check run with the posted URL.
+      - name: Mint the checks token
+        id: check-token
+        if: steps.post.outputs.review_url != '' && needs.check-start.outputs.check_run_id != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POFIX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      # The conclusion is a fixed function of the verdict. The check text holds only the
+      # verdict, the review URL and the SHAs, nothing from the comment body.
+      - name: Complete the check run
+        if: steps.post.outputs.review_url != '' && needs.check-start.outputs.check_run_id != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.check-token.outputs.token }}
+          IN: ${{ runner.temp }}/pofix-in
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          CHECK_RUN_ID: ${{ needs.check-start.outputs.check_run_id }}
+          REVIEW_URL: ${{ steps.post.outputs.review_url }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$CHECK_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "unexpected check run id"
+          [[ "$REVIEW_URL" =~ ^https://[A-Za-z0-9.-]+/[^[:space:]]+$ ]] || fail "unexpected review URL"
+          jq --arg url "$REVIEW_URL" --arg skills "$SKILLS_SHA" '
+            {"approve": "success", "approve with nits": "success",
+             "block": "failure", "hold for the next major": "failure",
+             "changes suggested": "neutral", "inconclusive": "neutral"} as $map
+            | ($map[.verdict] // error("unknown verdict")) as $conclusion
+            | {status: "completed", conclusion: $conclusion,
+               output: {title: ("pofix: " + .verdict),
+                        summary: ("Review: \($url)\n\nHead \(.head_sha), base \(.base_sha), pofix-agent \($skills).")}}
+          ' "$IN/result.json" |
+            gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_RUN_ID" --input - > /dev/null
+
+  # Completes a check run that post left in progress: the head moved, a job failed, was
+  # skipped or was cancelled, the review was posted but the check could not be completed,
+  # an earlier run already posted the review, or post found nothing to post. The conclusion is neutral and
+  # the text gives the reason from the job results and links the run.
+  check-finish:
+    needs: [gate, check-start, verify, review, post]
+    if: ${{ always() && needs.check-start.outputs.check_run_id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Mint the checks token
+        id: check-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POFIX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-checks: write
+
+      - name: Complete a check run left in progress
+        env:
+          GH_TOKEN: ${{ steps.check-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          CHECK_RUN_ID: ${{ needs.check-start.outputs.check_run_id }}
+          HEAD_MOVED: ${{ needs.verify.outputs.head_moved }}
+          VERIFY_RESULT: ${{ needs.verify.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          POST_RESULT: ${{ needs.post.result }}
+          POSTED_URL: ${{ needs.post.outputs.posted_url }}
+          ALREADY_POSTED_URL: ${{ needs.post.outputs.already_posted_url }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$CHECK_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "unexpected check run id"
+          status="$(gh api "repos/$REPOSITORY/check-runs/$CHECK_RUN_ID" --jq '.status')"
+          if [ "$status" = "completed" ]; then
+            echo "check run $CHECK_RUN_ID is already completed"
+            exit 0
+          fi
+          title="pofix: did not finish"
+          if [ "$HEAD_MOVED" = "true" ]; then
+            reason="The pull request head moved after the request. Nothing was reviewed."
+          elif [ "$VERIFY_RESULT" = "cancelled" ]; then
+            reason="The verify job was cancelled. Nothing was reviewed."
+          elif [ "$REVIEW_RESULT" != "success" ]; then
+            reason="The review job ended '$REVIEW_RESULT'. Nothing was posted."
+          elif [[ "$POSTED_URL" =~ ^https://[A-Za-z0-9.-]+/[^[:space:]]+$ ]]; then
+            title="pofix: check not completed"
+            reason="Review posted: $POSTED_URL. The check could not be completed."
+          elif [ "$POST_RESULT" != "success" ]; then
+            reason="The post job ended '$POST_RESULT'. The review may not be posted."
+          elif [[ "$ALREADY_POSTED_URL" =~ ^https://[A-Za-z0-9.-]+/[^[:space:]]+$ ]]; then
+            title="pofix: already posted"
+            reason="Already posted by an earlier run: $ALREADY_POSTED_URL"
+          else
+            reason="Nothing was posted: the head moved during the review, or the review did not cover the requested head."
+          fi
+          jq -n --arg title "$title" --arg reason "$reason" --arg url "$RUN_URL" \
+            '{status: "completed", conclusion: "neutral",
+              output: {title: $title, summary: "\($reason)\n\nRun: \($url)"}}' |
+            gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_RUN_ID" --input - > /dev/null
