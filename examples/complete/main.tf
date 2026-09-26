@@ -7,9 +7,10 @@ locals {
   name   = "ex-${basename(path.cwd)}"
 
   tags = {
-    Name       = local.name
-    Example    = local.name
-    Repository = "https://github.com/terraform-aws-modules/terraform-aws-s3-bucket"
+    Name        = local.name
+    Example     = local.name
+    Repository  = "https://github.com/terraform-aws-modules/terraform-aws-s3-bucket"
+    Environment = "example"
   }
 }
 
