@@ -1,0 +1,767 @@
+# Pofix pull request review: the reusable workflow.
+#
+# A template to copy, not a live workflow. Copy it into the central repository as
+# .github/workflows/pr-review.yml. Each module repository then calls it with the short
+# caller in pr-review-caller.yml.template, pinned to this file's commit SHA.
+#
+# A maintainer comment containing "@pofix" on a pull request starts one run:
+#   gate   - checks the commenter and the inputs and pins the head. No secret, no App token.
+#   verify - runs terraform init and validate on the head's examples, with no credential,
+#            and uploads the results as one JSON file.
+#   review - runs the terraform-module-pr-review skill render-only, with a read-only
+#            App token, and uploads comment.md and result.json as an artifact.
+#   post   - validates the artifact, re-reads the head, skips a duplicate, and posts one
+#            review with the event COMMENT, using a separate write token.
+#
+# This file has no placeholder to fill. The action SHAs, the terraform-skill SHA, the
+# Terraform MCP server release checksum, the Terraform version and the apt versions are
+# pinned here; upgrade them by editing this file.
+# Setup, prerequisites and how to pin or upgrade: ci/github/README.md
+#
+# Items marked [verify] are assumptions the live pilot must confirm.
+
+name: pofix pull request review
+
+on:
+  workflow_call:
+    inputs:
+      skills_repository:
+        description: The owner/name of the repository holding the pofix-agent skills.
+        required: true
+        type: string
+      skills_sha:
+        description: The 40-hex commit of skills_repository to run.
+        required: true
+        type: string
+    secrets:
+      POFIX_APP_PRIVATE_KEY:
+        required: true
+
+permissions: {}
+
+# Shared by the review and post jobs, which check the same output twice: once before the
+# upload, once after the download. The verdicts are the six in the skill's
+# references/render-output.md. proposed_event is only checked for shape and never used:
+# the event posted is always COMMENT.
+env:
+  RESULT_CONTRACT: >-
+    type == "object"
+    and (keys == ["base_sha", "head_sha", "number", "proposed_event", "target", "verdict"])
+    and .target == $target
+    and .number == $number
+    and (.head_sha | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.base_sha | type == "string" and test("^[0-9a-f]{40}$"))
+    and (.verdict | IN("hold for the next major", "block", "inconclusive",
+      "changes suggested", "approve with nits", "approve"))
+    and (.proposed_event | type == "string" and test("^[A-Z_]{1,20}$"))
+  LEAK_PATTERN: 'ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|AKIA[0-9A-Z]{12,}|ASIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]+\.eyJ|/home/runner'
+
+jobs:
+  gate:
+    # The comment body is read here and nowhere else. The if: runs before any runner starts.
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.action == 'created' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '@pofix') &&
+      github.event.comment.user.type == 'User' &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      repository: ${{ steps.check.outputs.repository }}
+      pr_number: ${{ steps.check.outputs.pr_number }}
+      comment_id: ${{ steps.check.outputs.comment_id }}
+      skills_repository: ${{ steps.check.outputs.skills_repository }}
+      skills_sha: ${{ steps.check.outputs.skills_sha }}
+      head_sha: ${{ steps.check.outputs.head_sha }}
+    steps:
+      - name: Check the commenter and the inputs
+        id: check
+        env:
+          # The collaborator permission endpoint needs only metadata read, which the job
+          # token keeps under permissions: {}. The pull request read works on a public
+          # repository with no permission; a private one needs pull-requests: read. [verify]
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.issue.number }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENTER: ${{ github.event.comment.user.login }}
+          SKILLS_REPOSITORY: ${{ inputs.skills_repository }}
+          SKILLS_SHA: ${{ inputs.skills_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "unexpected repository name"
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || fail "unexpected pull request number"
+          [[ "$COMMENT_ID" =~ ^[1-9][0-9]*$ ]] || fail "unexpected comment id"
+          [[ "$COMMENTER" =~ ^[A-Za-z0-9-]+$ ]] || fail "unexpected commenter login"
+          [[ "$SKILLS_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "skills_repository is not owner/name"
+          [[ "$SKILLS_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "skills_sha is not a 40-hex commit"
+          permission="$(gh api "repos/$REPOSITORY/collaborators/$COMMENTER/permission" --jq '.permission')"
+          case "$permission" in
+            admin|maintain|write) ;;
+            *) fail "commenter permission is '$permission', not admin, maintain or write" ;;
+          esac
+          # The head the review is pinned to. Residual: a push after the maintainer read the
+          # pull request but before the comment is not detectable here; the review covers
+          # whatever head this read returns.
+          head_sha="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha')"
+          [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || fail "unexpected head commit"
+          {
+            echo "repository=$REPOSITORY"
+            echo "pr_number=$PR_NUMBER"
+            echo "comment_id=$COMMENT_ID"
+            echo "skills_repository=$SKILLS_REPOSITORY"
+            echo "skills_sha=$SKILLS_SHA"
+            echo "head_sha=$head_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  # The only job that runs anything the head controls: terraform init and validate on the
+  # example directories the change touches, through the skill's verify-pass.sh. It holds no
+  # secret, no App token, no id-token and no AWS credential; its job token has no
+  # permission, and the reads it makes work on a public repository without one. [verify]
+  # Before any head code runs, Docker and passwordless sudo go, and the pass itself runs in
+  # bubblewrap with a cleared environment and its own process namespace, so no head process
+  # outlives it or reads a later step's environment.
+  # Its output is untrusted: the review job checks the file's form, and the skill binds it
+  # to the head, the merge base and the changed files with verify-pass.sh check. The results
+  # come from running providers the head chose, so a pass is evidence, not proof.
+  verify:
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions: {}
+    concurrency:
+      group: pofix-verify-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    outputs:
+      head_moved: ${{ steps.workspace.outputs.head_moved }}
+      artifact_id: ${{ steps.upload-verify.outputs.artifact-id }}
+    steps:
+      - name: Download the pinned skills
+        env:
+          SKILLS_REPOSITORY: ${{ needs.gate.outputs.skills_repository }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/pofix-agent"
+          git init -q "$dest"
+          git -C "$dest" -c core.hooksPath=/dev/null fetch -q --depth 1 --no-tags "https://github.com/$SKILLS_REPOSITORY.git" "$SKILLS_SHA"
+          git -C "$dest" -c core.hooksPath=/dev/null -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$dest" rev-parse HEAD)" = "$SKILLS_SHA" ] || { echo "::error::$SKILLS_REPOSITORY is not at $SKILLS_SHA"; exit 1; }
+
+      # The run directory has the shape verify-pass.md requires: <root>/pr-review.XXXXXX with
+      # the clone at <run>/clone and an empty plugin cache beside it. The head is data here:
+      # hooks and LFS filters are off, and nothing in this job loads configuration from it.
+      # A head that moved after the gate stops the run here: head_moved is set, the later
+      # steps and the review job skip, and nothing is posted.
+      - name: Materialize the head and the changed files
+        id: workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          pr="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          if [ "$(jq -r '.head.sha' <<< "$pr")" != "$GATE_HEAD" ]; then
+            echo "::notice::the head moved after the request; nothing is verified or reviewed"
+            echo "The pull request head moved after the request. Nothing was verified, reviewed or posted." >> "$GITHUB_STEP_SUMMARY"
+            echo "head_moved=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base_ref="$(jq -r '.base.sha' <<< "$pr")"
+          [[ "$base_ref" =~ ^[0-9a-f]{40}$ ]] || fail "unexpected base commit"
+          merge_base="$(gh api "repos/$REPOSITORY/compare/$base_ref...$GATE_HEAD" --jq '.merge_base_commit.sha')"
+          [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || fail "unexpected merge base"
+          root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          run="$(mktemp -d "$root/pr-review.XXXXXX")"
+          clone="$run/clone"
+          mkdir "$run/plugin-cache"
+          git init -q --template= "$clone"
+          git -C "$clone" remote add origin "https://github.com/$REPOSITORY.git"
+          clone_git() {
+            GIT_LFS_SKIP_SMUDGE=1 git -C "$clone" -c core.hooksPath=/dev/null \
+              -c filter.lfs.smudge=cat -c filter.lfs.process= -c filter.lfs.required=false "$@"
+          }
+          # By commit: GitHub serves a fork's head commit from the base repository. [verify]
+          # Otherwise the pull request's own ref, whose commit must still be the gate's head.
+          if ! clone_git fetch -q --depth=1 --no-tags origin "$GATE_HEAD"; then
+            clone_git fetch -q --depth=1 --no-tags origin "refs/pull/$PR_NUMBER/head"
+          fi
+          [ "$(git -C "$clone" rev-parse FETCH_HEAD)" = "$GATE_HEAD" ] || fail "the fetched commit is not the requested one"
+          clone_git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$clone" rev-parse HEAD)" = "$GATE_HEAD" ] || fail "the working copy is not at the requested commit"
+          files="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" --paginate --slurp)"
+          jq 'add' <<< "$files" > "$run/files.json"
+          # The module root is the repository root, as in terraform-aws-modules. [verify]
+          {
+            echo "head_moved=false"
+            echo "run=$run"
+            echo "merge_base=$merge_base"
+          } >> "$GITHUB_OUTPUT"
+
+      # The same lockdown as the review job, before any head code: pinned bubblewrap, no
+      # Docker, no passwordless sudo.
+      - name: Lock down the runner
+        if: steps.workspace.outputs.head_moved == 'false'
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap=0.9.0-1ubuntu0.3 socat=1.8.0.0-4ubuntu0.1
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc true
+          sudo systemctl stop docker.socket docker.service
+          if curl -fsS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/_ping > /dev/null 2>&1; then
+            fail "the Docker socket still answers"
+          fi
+          # The hosted image grants passwordless sudo through this file. [verify]
+          sudo rm -f /etc/sudoers.d/runner
+          if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
+
+      - name: Install Terraform
+        if: steps.workspace.outputs.head_moved == 'false'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+
+      # The pass runs in bubblewrap: the root file system read-only; the runner temp
+      # directory, the runner's own install directories and the tool cache each replaced by
+      # an empty file system where they exist; then only the skills and the terraform binary
+      # directory (read-only), the run directory, a home directory and an output directory
+      # put back; a cleared environment; a new process namespace that ends with bubblewrap;
+      # and a new session. The network stays shared, because init needs the registry.
+      # terraform must run inside the sandbox, or the step fails rather than read as absent.
+      # The script is called by its absolute path in the pinned skills, and it fetches the
+      # merge base itself when a re-run needs it. After bubblewrap exits, and every head
+      # process with it, the output directory must hold only verify.json as a regular file
+      # with one link, checked without following links, before it is copied out.
+      - name: Run the verification pass
+        if: steps.workspace.outputs.head_moved == 'false'
+        # A hung init or validate fails this step, so the job ends failure and the review still
+        # runs without results. The job timeout above is only the backstop.
+        timeout-minutes: 20
+        env:
+          RUN: ${{ steps.workspace.outputs.run }}
+          MERGE_BASE: ${{ steps.workspace.outputs.merge_base }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          skills="$RUNNER_TEMP/pofix-agent"
+          home="$RUNNER_TEMP/verify-home"
+          result="$RUNNER_TEMP/verify-result"
+          mkdir "$home" "$result" "$RUNNER_TEMP/verify-out"
+          tf_dir="$(dirname "$(readlink -f "$(command -v terraform)")")"
+          hide=()
+          # /run/user is hidden so a user systemd or D-Bus socket cannot start a process outside
+          # the PID namespace; the pilot expects /run/user/<uid> to be absent. [verify]
+          for d in "$RUNNER_TEMP" /home/runner/actions-runner /home/runner/runners "${RUNNER_TOOL_CACHE:-}" /run/user; do
+            [ -n "$d" ] && [ -d "$d" ] && hide+=(--tmpfs "$d")
+          done
+          bwrap --unshare-pid --die-with-parent --new-session \
+            --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp \
+            "${hide[@]}" \
+            --ro-bind "$tf_dir" "$tf_dir" --ro-bind "$skills" "$skills" \
+            --bind "$RUN" "$RUN" --bind "$home" "$home" --bind "$result" "$result" \
+            --clearenv --setenv PATH "$tf_dir:/usr/bin:/bin" --setenv HOME "$home" --setenv TMPDIR "$home" \
+            -- bash -c 'terraform version > /dev/null || { echo "terraform does not run in the sandbox" >&2; exit 3; }; exec bash "$@"' _ \
+            "$skills/.agents/skills/terraform-module-pr-review/references/verify-pass.sh" \
+            run "$RUN" --files "$RUN/files.json" --base "$MERGE_BASE" --out "$result/verify.json"
+          [ "$(find "$result" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "verify.json" ] || fail "the sandbox left more than verify.json"
+          [ "$(find "$result" -mindepth 1 -maxdepth 1 -name verify.json -type f -links 1 -printf "%f\n")" = "verify.json" ] || fail "verify.json is not a regular file with one link"
+          cp -P -- "$result/verify.json" "$RUNNER_TEMP/verify-out/verify.json"
+
+      # Only the one JSON file leaves this job, as a regular file with one link, copied into
+      # a fresh directory. Nothing else from the head is uploaded.
+      - name: Check and stage the verification results
+        if: steps.workspace.outputs.head_moved == 'false'
+        env:
+          OUT: ${{ runner.temp }}/verify-out
+          STAGE: ${{ runner.temp }}/verify-upload
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n")" = "verify.json" ] || fail "the verification output is not one regular file"
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "verify.json" ] || fail "the verification output holds more than verify.json"
+          jq -e 'type == "object"' "$OUT/verify.json" > /dev/null || fail "verify.json is not a JSON object"
+          mkdir "$STAGE"
+          cp -- "$OUT/verify.json" "$STAGE/"
+
+      - name: Upload the verification results
+        id: upload-verify
+        if: steps.workspace.outputs.head_moved == 'false'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pofix-verify-${{ github.run_id }}
+          path: ${{ runner.temp }}/verify-upload
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # The review runs whether or not verify succeeded, so a verify job that fails, has its pass
+  # step time out, or is made to crash by the head does not suppress the review; the prompt
+  # then says that verification did not run. A failed verify job, including one whose pass
+  # hit its step timeout, lets the review run. A head that moved after the gate still stops
+  # it. A verify job that ends cancelled, as a pending one replaced in its concurrency group
+  # does, skips the review rather than posting without verification: the newer comment's
+  # run does the review. The verify job timeout is only a backstop; a job that hits it ends
+  # cancelled and would skip the review too. [verify]
+  review:
+    needs: [gate, verify]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.verify.result != 'cancelled' && needs.verify.outputs.head_moved != 'true' }}
+    outputs:
+      artifact_id: ${{ steps.upload-review.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload-review.outputs.artifact-digest }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+    # Keyed after the gate, so a comment the gate refuses never replaces a queued review.
+    # One review at a time per pull request; a running review is never cancelled.
+    concurrency:
+      group: pofix-review-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Mint the read-only token for the agent
+        id: read-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POFIX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: read
+          permission-issues: read
+          permission-checks: read
+          permission-statuses: read
+
+      # claude-code-action restores CLAUDE.md, CLAUDE.local.md, .claude.json and all of .claude/
+      # from the default branch into the workspace. Until the pilot shows that
+      # --setting-sources user keeps them from loading, a repository that ships any of them is
+      # refused. Removable after the pilot. [verify]
+      - name: Refuse a default branch with agent configuration
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+        run: |
+          set -euo pipefail
+          for path in CLAUDE.md CLAUDE.local.md .claude.json .claude; do
+            if answer="$(gh api "repos/$REPOSITORY/contents/$path" --jq 'type' 2>&1)"; then
+              echo "::error::the default branch has $path; this workflow does not review such repositories yet"
+              exit 1
+            fi
+            case "$answer" in
+              *"HTTP 404"*) ;;
+              *) echo "::error::could not check $path on the default branch"; exit 1 ;;
+            esac
+          done
+
+      - name: Download the pinned skills
+        env:
+          SKILLS_REPOSITORY: ${{ needs.gate.outputs.skills_repository }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+          # antonbabenko/terraform-skill v1.17.1, the general Terraform guidance.
+          TERRAFORM_SKILLS_SHA: b59d2be9ff4db8f835c8459e05e325ba11e3a21f
+        run: |
+          set -euo pipefail
+          # Plain git with no credential: nothing is persisted for a later step.
+          # A private skills repository needs a read token here; see ci/github/README.md.
+          fetch_skills() { # destination, owner/name, 40-hex commit
+            local dest="$1" skills_repo="$2" skills_rev="$3"
+            git init -q "$dest"
+            git -C "$dest" -c core.hooksPath=/dev/null fetch -q --depth 1 --no-tags "https://github.com/$skills_repo.git" "$skills_rev"
+            git -C "$dest" -c core.hooksPath=/dev/null -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+            [ "$(git -C "$dest" rev-parse HEAD)" = "$skills_rev" ] || { echo "::error::$skills_repo is not at $skills_rev"; exit 1; }
+          }
+          fetch_skills "$RUNNER_TEMP/pofix-agent" "$SKILLS_REPOSITORY" "$SKILLS_SHA"
+          fetch_skills "$RUNNER_TEMP/terraform-skill" antonbabenko/terraform-skill "$TERRAFORM_SKILLS_SHA"
+          # The user skills directory holds one link per skill, so skills load from these
+          # pinned copies only, never from the workspace.
+          mkdir -p "$HOME/.claude/skills"
+          for d in "$RUNNER_TEMP/pofix-agent/.agents/skills"/*/ "$RUNNER_TEMP/terraform-skill/skills"/*/; do
+            ln -s "${d%/}" "$HOME/.claude/skills/$(basename "$d")"
+          done
+          ls -l "$HOME/.claude/skills"
+
+      - name: Prepare an empty workspace
+        env:
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+        run: |
+          set -euo pipefail
+          # The pull request head is never placed here; the skill materializes it as data
+          # under its own temporary directory. claude-code-action restores its config paths
+          # from the base branch in a git work tree, so the workspace is an empty repository
+          # with one empty commit. [verify]
+          test -z "$(ls -A "$GITHUB_WORKSPACE")"
+          git init -q "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" -c user.name=pofix -c user.email=pofix@users.noreply.github.com commit -q --allow-empty -m "empty workspace"
+          git -C "$GITHUB_WORKSPACE" remote add origin "https://github.com/$REPOSITORY.git"
+          mkdir "$RUNNER_TEMP/pofix-out"
+
+      - name: Install the sandbox dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # The noble Updates versions on 2026-09-25. A newer security update retires these
+          # from the archive; the install then fails and the pins need bumping. [verify]
+          sudo apt-get install -y --no-install-recommends bubblewrap=0.9.0-1ubuntu0.3 socat=1.8.0.0-4ubuntu0.1
+          # Ubuntu 24.04 stops unprivileged user namespaces, which bubblewrap needs. [verify]
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --ro-bind / / --dev /dev --proc /proc true
+
+      # The Terraform MCP server runs from its release binary, pinned by checksum, so the job
+      # needs no Docker. It runs outside the sandbox with an empty environment.
+      - name: Install the Terraform MCP server
+        env:
+          MCP_VERSION: 1.3.0
+          MCP_SHA256: f8ecdbfb8473af4d54f6ca428de59649ff4c74f1c8a904da1c2973fa345d4d26
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/terraform-mcp"
+          mkdir "$dir"
+          zip="$dir/terraform-mcp-server.zip"
+          curl -fsSL -o "$zip" "https://releases.hashicorp.com/terraform-mcp-server/${MCP_VERSION}/terraform-mcp-server_${MCP_VERSION}_linux_amd64.zip"
+          echo "$MCP_SHA256  $zip" | sha256sum -c --quiet
+          unzip -q "$zip" terraform-mcp-server -d "$dir"
+          rm -f "$zip"
+          "$dir/terraform-mcp-server" --version
+
+      # The verify job's results, untrusted: one regular file with one link, and nothing else.
+      # The skill accepts them only after verify-pass.sh check binds them to this run.
+      # Only when verify succeeded, and by the artifact id its upload returned, never by name.
+      - name: Download the verification results
+        if: needs.verify.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.verify.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/pofix-verify
+
+      - name: Note that verification did not run
+        if: needs.verify.result != 'success'
+        env:
+          VERIFY_RESULT: ${{ needs.verify.result }}
+        run: |
+          echo "::notice::the verify job ended '$VERIFY_RESULT'; the review records the example checks as not run"
+          echo "The verify job ended '$VERIFY_RESULT'. The review ran without verification results and records the example checks as not run." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the verification results
+        if: needs.verify.result == 'success'
+        env:
+          VERIFY: ${{ runner.temp }}/pofix-verify
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$(find "$VERIFY" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n")" = "verify.json" ] || fail "the verification results are not one regular file"
+          [ "$(find "$VERIFY" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "verify.json" ] || fail "the verification results hold more than verify.json"
+
+      # No Terraform in this job: terraform init runs providers the head chooses, and this
+      # job holds credentials. The verify job runs init and validate without credentials.
+      # Then Docker and passwordless sudo go, so sandboxed Bash can reach neither.
+      - name: Lock down the runner
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          for t in $(type -ap terraform); do sudo rm -f "$t"; done
+          hash -r
+          if command -v terraform > /dev/null; then fail "terraform is still on PATH"; fi
+          sudo systemctl stop docker.socket docker.service
+          if curl -fsS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/_ping > /dev/null 2>&1; then
+            fail "the Docker socket still answers"
+          fi
+          # The hosted image grants passwordless sudo through this file. [verify]
+          sudo rm -f /etc/sudoers.d/runner
+          if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
+
+      # The AWS credentials exist only from this step on, for the model calls to Bedrock.
+      # Two layers below keep them from the agent, neither covering everything alone:
+      # sandbox.credentials unsets them for sandboxed Bash only; the Read deny rules and
+      # sandbox.filesystem.denyRead keep process environments and the runner's own files
+      # out of reach of Read, Glob, Grep and Bash. On Linux a denyRead wildcard may cover
+      # only the paths that exist when it is applied, so processes started later may not be
+      # covered; the pilot runs `cat /proc/*/environ` from sandboxed Bash and expects a
+      # refusal. [verify]
+      - name: Assume the Bedrock role
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.POFIX_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.POFIX_AWS_REGION }}
+          role-session-name: pofix-review-${{ github.run_id }}
+          role-duration-seconds: 3600
+          mask-aws-account-id: true
+
+      - name: Run the review
+        id: claude
+        uses: anthropics/claude-code-action@9171db3e57d6a3140a37ddc2ba92788584e0ead6 # v1.0.234
+        with:
+          use_bedrock: true
+          github_token: ${{ steps.read-token.outputs.token }}
+          # The prompt is built from the gate outputs and the output directory only.
+          prompt: |
+            Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
+            The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
+            This is a hosted run with no local conversation, so it is render-only. Do not post anything to GitHub.
+            Output directory: ${{ runner.temp }}/pofix-out
+            ${{ needs.verify.result == 'success' && format('Verification results file: {0}/pofix-verify/verify.json', runner.temp) || 'Verification did not run: there is no verification results file. Record every example check as not run.' }}
+            No AWS profile is named for this run, so the plan pass does not run.
+          # Written to the user settings file, where sandbox credentials and the strict
+          # allowlist are honored. Key names from the Claude Code sandboxing and permissions
+          # docs. The Read deny rules apply to Read and, best effort, to Glob and Grep; the
+          # sandbox settings apply to Bash only. The skill's own temporary directory and
+          # the skills under the runner temp directory stay readable. The runner install
+          # path is the hosted image's layout. [verify] denyWrite keeps sandboxed Bash out of
+          # the workspace; no later step reads it either. No Terraform host is allowed: this
+          # job runs no terraform, and the MCP server is not sandboxed.
+          settings: |
+            {
+              "permissions": {
+                "deny": [
+                  "Read(//proc/*/environ)",
+                  "Read(//proc/*/task/*/environ)",
+                  "Read(/${{ runner.temp }}/_runner_file_commands/**)",
+                  "Read(/${{ runner.temp }}/_github_workflow/**)",
+                  "Read(//home/runner/runners/**)",
+                  "Read(//home/runner/actions-runner/**)"
+                ]
+              },
+              "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "network": {
+                  "strictAllowlist": true,
+                  "allowedDomains": [
+                    "api.github.com",
+                    "github.com",
+                    "codeload.github.com",
+                    "objects.githubusercontent.com"
+                  ]
+                },
+                "filesystem": {
+                  "allowWrite": ["${{ runner.temp }}/pofix-out"],
+                  "denyWrite": ["${{ github.workspace }}"],
+                  "denyRead": [
+                    "/proc/*/environ",
+                    "/proc/*/task/*/environ",
+                    "${{ runner.temp }}/_runner_file_commands",
+                    "${{ runner.temp }}/_github_workflow",
+                    "/home/runner/runners",
+                    "/home/runner/actions-runner"
+                  ]
+                },
+                "credentials": {
+                  "envVars": [
+                    { "name": "AWS_ACCESS_KEY_ID", "mode": "deny" },
+                    { "name": "AWS_SECRET_ACCESS_KEY", "mode": "deny" },
+                    { "name": "AWS_SESSION_TOKEN", "mode": "deny" },
+                    { "name": "AWS_BEARER_TOKEN_BEDROCK", "mode": "deny" },
+                    { "name": "AWS_REGION", "mode": "deny" },
+                    { "name": "AWS_DEFAULT_REGION", "mode": "deny" },
+                    { "name": "ACTIONS_ID_TOKEN_REQUEST_TOKEN", "mode": "deny" },
+                    { "name": "ACTIONS_ID_TOKEN_REQUEST_URL", "mode": "deny" },
+                    { "name": "ACTIONS_RUNTIME_TOKEN", "mode": "deny" },
+                    { "name": "ACTIONS_RUNTIME_URL", "mode": "deny" },
+                    { "name": "ACTIONS_RESULTS_URL", "mode": "deny" },
+                    { "name": "ACTIONS_CACHE_URL", "mode": "deny" }
+                  ]
+                }
+              }
+            }
+          # --setting-sources user and --strict-mcp-config keep the base branch's restored
+          # .claude/ and .mcp.json from loading. [verify] No Edit, Write or web tool.
+          claude_args: >-
+            --model ${{ vars.POFIX_BEDROCK_MODEL }}
+            --max-turns 150
+            --setting-sources user
+            --strict-mcp-config
+            --mcp-config '{"mcpServers":{"terraform":{"command":"/usr/bin/env","args":["-i","HOME=${{ runner.temp }}/terraform-mcp","PATH=/usr/bin:/bin","${{ runner.temp }}/terraform-mcp/terraform-mcp-server","stdio"]}}}'
+            --allowedTools "Skill,Read,Glob,Grep,Bash,mcp__terraform"
+            --disallowedTools "Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch"
+
+      # The agent wrote the output directory, so it is untrusted. upload-artifact follows
+      # symbolic links, so only two regular files with one link each are accepted, checked
+      # against the contract and the leak scan here, before anything leaves the runner, and
+      # copied into a fresh directory that is what gets uploaded.
+      - name: Check and stage the review output
+        env:
+          OUT: ${{ runner.temp }}/pofix-out
+          STAGE: ${{ runner.temp }}/pofix-upload
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          READ_TOKEN: ${{ steps.read-token.outputs.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          expected="comment.md result.json "
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output is not exactly comment.md and result.json"
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output holds a link or a special file"
+          [ -s "$OUT/comment.md" ] || fail "comment.md is empty"
+          jq -e --arg target "$REPOSITORY#$PR_NUMBER" --argjson number "$PR_NUMBER" "$RESULT_CONTRACT" "$OUT/result.json" > /dev/null || fail "result.json does not match the contract"
+          if grep -qE -- "$LEAK_PATTERN" "$OUT/comment.md" "$OUT/result.json"; then fail "the review output matches a leak pattern"; fi
+          if grep -qF -- "pofix-review:" "$OUT/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
+          [ "$(wc -c < "$OUT/comment.md")" -le 65000 ] || fail "comment.md is too large to post"
+          mkdir "$STAGE"
+          cp -- "$OUT/comment.md" "$OUT/result.json" "$STAGE/"
+          # Again on the staged copies, in case a file changed between the check and the cp.
+          [ "$(find "$STAGE" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the staged output is not two regular files"
+          if grep -qE -- "$LEAK_PATTERN" "$STAGE/comment.md" "$STAGE/result.json"; then fail "the staged output matches a leak pattern"; fi
+          if grep -qF -- "pofix-review:" "$STAGE/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
+          # The literal values, and their plain base64, of the secrets this job holds. The
+          # values are masked in the log already and are never printed here. A secret
+          # base64-encoded at another offset inside a longer string is not caught.
+          # ACTIONS_RUNTIME_TOKEN is checked when the runner exposes it to run steps. [verify]
+          for name in AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN READ_TOKEN GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN; do
+            value="${!name:-}"
+            [ -n "$value" ] || continue
+            encoded="$(printf '%s' "$value" | base64 -w0)"
+            if grep -qF -e "$value" -e "$encoded" "$STAGE/comment.md" "$STAGE/result.json"; then
+              fail "the staged output contains the value of $name"
+            fi
+          done
+
+      - name: Upload the review output
+        id: upload-review
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          # No run_attempt in the name; post downloads by the id below, not by this name.
+          name: pofix-review-${{ github.run_id }}
+          path: ${{ runner.temp }}/pofix-upload
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # Explicit, because a failed verify job upstream of review would otherwise skip post
+  # through the default success() check.
+  post:
+    needs: [gate, review]
+    if: ${{ !cancelled() && needs.gate.result == 'success' && needs.review.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    concurrency:
+      group: pofix-post-${{ github.repository }}-${{ github.event.comment.id }}
+      cancel-in-progress: false
+    steps:
+      # By the id review's upload returned, so an artifact another step planted under the
+      # same name is never read. download-artifact checks the digest the service recorded;
+      # that it equals review's artifact-digest output is [verify], and the output is logged.
+      - name: Download the review output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.review.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/pofix-in
+
+      - name: Record the review artifact
+        env:
+          ARTIFACT_ID: ${{ needs.review.outputs.artifact_id }}
+          ARTIFACT_DIGEST: ${{ needs.review.outputs.artifact_digest }}
+        run: echo "review artifact $ARTIFACT_ID, digest $ARTIFACT_DIGEST"
+
+      - name: Validate the review output
+        env:
+          IN: ${{ runner.temp }}/pofix-in
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          expected="comment.md result.json "
+          [ "$(find "$IN" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "unexpected files in the artifact"
+          [ "$(find "$IN" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the artifact holds a link or a special file"
+          jq -e --arg target "$REPOSITORY#$PR_NUMBER" --argjson number "$PR_NUMBER" "$RESULT_CONTRACT" "$IN/result.json" > /dev/null || fail "result.json does not match the contract"
+          [ -s "$IN/comment.md" ] || fail "comment.md is empty"
+
+      - name: Mint the write token
+        id: write-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.POFIX_APP_CLIENT_ID }}
+          private-key: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ steps.write-token.outputs.token }}
+          IN: ${{ runner.temp }}/pofix-in
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          COMMENT_ID: ${{ needs.gate.outputs.comment_id }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          APP_BOT: ${{ steps.write-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          head_sha="$(jq -r '.head_sha' "$IN/result.json")"
+          base_sha="$(jq -r '.base_sha' "$IN/result.json")"
+          marker="<!-- pofix-review:comment-$COMMENT_ID -->"
+
+          # The review must cover the head the gate pinned when the comment arrived.
+          if [ "$head_sha" != "$GATE_HEAD" ]; then
+            echo "::notice::the review covers $head_sha, not the requested head $GATE_HEAD; nothing posted"
+            exit 0
+          fi
+
+          # The body describes one head. If the head moved, post nothing.
+          current="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.head.sha')"
+          if [ "$current" != "$head_sha" ]; then
+            echo "::notice::head moved from $head_sha to $current during the review; nothing posted"
+            exit 0
+          fi
+
+          # One review per triggering comment, across re-runs. Only reviews by this App count,
+          # so nobody else can suppress a review by quoting the marker.
+          # Read first, so an API error stops the job instead of passing as "not posted".
+          reviews="$(gh api --paginate "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews")"
+          bodies="$(jq -r --arg bot "$APP_BOT" '.[] | select(.user.login == $bot) | .body' <<< "$reviews")"
+          if grep -qF -- "$marker" <<< "$bodies"; then
+            echo "::notice::a review for comment $COMMENT_ID is already posted; nothing posted"
+            exit 0
+          fi
+
+          body="$RUNNER_TEMP/body.md"
+          {
+            cat "$IN/comment.md"
+            printf '\n\n---\nReviewed head %s, base %s, pofix-agent %s.\n%s\n' "$head_sha" "$base_sha" "$SKILLS_SHA" "$marker"
+          } > "$body"
+
+          # Fail closed on anything that looks like a token, a key or a runner path.
+          if grep -qE -- "$LEAK_PATTERN" "$body"; then
+            fail "the body matches a leak pattern; nothing posted"
+          fi
+          [ "$(wc -c < "$body")" -le 65536 ] || fail "the body is over 65536 bytes; nothing posted"
+          # A live at-mention would notify someone. The skill is not trusted to have wrapped
+          # every mention, and a regex cannot follow GitHub's markdown rules, so GitHub's own
+          # renderer is the ground truth: the final body, footer included, is rendered, and
+          # any mention link in the output blocks the post. The class names are [verify].
+          # The result is kept in a variable, so an API error stops the job under set -e.
+          # The render links a team mention only when the token can see the team, so the
+          # team form @org/team is refused outright, in code or not.
+          if grep -qE '@[A-Za-z0-9-]+/[A-Za-z0-9_.-]+' "$body"; then
+            fail "the body has a team-form at-mention; nothing posted"
+          fi
+          rendered="$(jq -n --rawfile t "$body" --arg c "$REPOSITORY" '{text: $t, mode: "gfm", context: $c}' | gh api markdown --input -)"
+          if grep -qE 'class="(user|team)-mention' <<< "$rendered"; then
+            fail "the body renders a live at-mention; nothing posted"
+          fi
+
+          # commit_id binds the review to the head checked above.
+          jq -n --rawfile body "$body" --arg head "$head_sha" '{body: $body, event: "COMMENT", commit_id: $head}' |
+            gh api --method POST "repos/$REPOSITORY/pulls/$PR_NUMBER/reviews" --input - --jq '.html_url'
