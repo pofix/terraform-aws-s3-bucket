@@ -10,6 +10,8 @@
 #            with an App token that can only write checks.
 #   verify - runs terraform init and validate on the head's examples, with no credential,
 #            and uploads the results as one JSON file.
+#   schema - restores the schema page cache, with no credential, and uploads the checked
+#            pages as one artifact.
 #   review - runs the terraform-module-pr-review skill render-only, with a read-only
 #            App token, and uploads comment.md and result.json as an artifact.
 #   post   - validates the artifact, re-reads the head, skips a duplicate, and posts one
@@ -46,6 +48,11 @@ on:
 
 permissions: {}
 
+# No job but schema touches the Actions cache; schema only reads it. The review never
+# saves: on issue_comment the default branch's cache is read-only anyway, and the warm
+# workflow in schema-cache.yml.template is its only intended writer.
+cache-mode: none
+
 # Shared by the review and post jobs, which check the same output twice: once before the
 # upload, once after the download. The verdicts are the six in the skill's
 # references/render-output.md. proposed_event is only checked for shape and never used:
@@ -62,6 +69,9 @@ env:
       "changes suggested", "approve with nits", "approve"))
     and (.proposed_event | type == "string" and test("^[A-Z_]{1,20}$"))
   LEAK_PATTERN: 'ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|AKIA[0-9A-Z]{12,}|ASIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]+\.eyJ|/home/runner'
+  # One schema cache page, relative to the cache directory:
+  # <namespace>/<name>/<version>/<resources|data-sources>/<type without the provider prefix>.md
+  SCHEMA_PAGE_RE: '^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}/[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}/(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md$'
 
 jobs:
   gate:
@@ -352,6 +362,83 @@ jobs:
           retention-days: 1
           overwrite: true
 
+  # Restores the schema page cache, the one input of this workflow that other workflows on
+  # the default branch write: the warm workflow, and any other that runs there on a
+  # trigger with cache write access. actions/cache/restore extracts its archive with tar -P,
+  # so a poisoned entry can write outside the restore path, over the code of later steps.
+  # That is why the restore runs here: no permission, no secret, no App token, no
+  # id-token, no AWS credential, Docker and passwordless sudo gone before it. Only the
+  # checked pages leave the job, as one artifact the review job downloads by id and checks
+  # again. The pages themselves stay untrusted data. Any failure here changes cost only.
+  schema:
+    needs: gate
+    if: vars.POFIX_SCHEMA_CACHE != 'off'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    cache-mode: read
+    outputs:
+      artifact_id: ${{ steps.upload-schema.outputs.artifact-id }}
+    steps:
+      - name: Lock down the runner
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          sudo systemctl stop docker.socket docker.service
+          if curl -fsS --max-time 5 --unix-socket /var/run/docker.sock http://localhost/_ping > /dev/null 2>&1; then
+            fail "the Docker socket still answers"
+          fi
+          # The hosted image grants passwordless sudo through this file. [verify]
+          sudo rm -f /etc/sudoers.d/runner
+          if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
+
+      # Provider documentation pages, one file per {provider, version, type}, saved by the
+      # warm workflow in schema-cache.yml.template, which runs only on schedule and
+      # workflow_dispatch on the default branch. This workflow never saves the cache: on
+      # issue_comment the default branch's cache is read-only. The key carries the format
+      # version: v1 is the page layout in SCHEMA_PAGE_RE and the page bytes as the
+      # registry's provider-docs content field. Change either, here and in the warm
+      # workflow together, and bump it.
+      - name: Restore the schema page cache
+        continue-on-error: true
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pofix-schema-restore
+          key: pofix-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: pofix-schema-pages-v1-
+
+      # The same check as in the review job, into a fresh directory that is what gets
+      # uploaded: regular files with one link, at a path SCHEMA_PAGE_RE accepts.
+      - name: Check the restored schema pages
+        id: schema-check
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          src="$RUNNER_TEMP/pofix-schema-restore"
+          dst="$RUNNER_TEMP/pofix-schema-upload"
+          mkdir -p "$dst"
+          if [ -d "$src" ] && [ ! -L "$src" ]; then
+            while IFS= read -r -d '' p; do
+              [[ "$p" =~ $SCHEMA_PAGE_RE ]] || continue
+              mkdir -p "$dst/${p%/*}" && cp -- "$src/$p" "$dst/$p"
+            done < <(cd "$src" && find . -type f -links 1 -size -1024k -printf '%P\0')
+          fi
+          n="$(find "$dst" -type f | wc -l)"
+          echo "schema pages restored: $n"
+          echo "pages=$n" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the schema pages
+        id: upload-schema
+        if: steps.schema-check.outputs.pages != '' && steps.schema-check.outputs.pages != '0'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pofix-schema-${{ github.run_id }}
+          path: ${{ runner.temp }}/pofix-schema-upload
+          if-no-files-found: ignore
+          retention-days: 1
+          overwrite: true
+
   # The review runs whether or not verify succeeded, so a verify job that fails, has its pass
   # step time out, or is made to crash by the head does not suppress the review; the prompt
   # then says that verification did not run. A failed verify job, including one whose pass
@@ -359,11 +446,12 @@ jobs:
   # it. A verify job that ends cancelled, as a pending one replaced in its concurrency group
   # does, skips the review rather than posting without verification: the newer comment's
   # run does the review. The verify job timeout is only a backstop; a job that hits it ends
-  # cancelled and would skip the review too. [verify]
+  # cancelled and would skip the review too. [verify] The schema job's result never stops
+  # the review: without its pages the skill fetches through the MCP server.
   # check-start is needed only for its output: the if: below has a status function, so a
   # failed check-start does not skip the review.
   review:
-    needs: [gate, check-start, verify]
+    needs: [gate, check-start, verify, schema]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.verify.result != 'cancelled' && needs.verify.outputs.head_moved != 'true' }}
     outputs:
       artifact_id: ${{ steps.upload-review.outputs.artifact-id }}
@@ -485,6 +573,39 @@ jobs:
           rm -f "$zip"
           "$dir/terraform-mcp-server" --version
 
+      # The schema job's checked pages, untrusted: downloaded by the artifact id its upload
+      # returned, never by name, and checked again below before the agent sees them. A
+      # schema job that was skipped, failed or found no page leaves no id, and the review
+      # runs without cached pages: cost only.
+      - name: Download the schema pages
+        if: needs.schema.result == 'success' && needs.schema.outputs.artifact_id != ''
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.schema.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/pofix-schema-restore
+
+      # Only regular files with one link, at a path SCHEMA_PAGE_RE accepts, are copied into
+      # the directory the agent reads; links, other files and odd names are dropped.
+      - name: Check the restored schema pages
+        id: schema-check
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          src="$RUNNER_TEMP/pofix-schema-restore"
+          dst="$RUNNER_TEMP/pofix-schema-cache"
+          mkdir -p "$dst"
+          if [ -d "$src" ] && [ ! -L "$src" ]; then
+            while IFS= read -r -d '' p; do
+              [[ "$p" =~ $SCHEMA_PAGE_RE ]] || continue
+              mkdir -p "$dst/${p%/*}" && cp -- "$src/$p" "$dst/$p"
+            done < <(cd "$src" && find . -type f -links 1 -size -1024k -printf '%P\0')
+          fi
+          rm -rf "$src"
+          echo "schema pages restored: $(find "$dst" -type f | wc -l)"
+
       # The verify job's results, untrusted: one regular file with one link, and nothing else.
       # The skill accepts them only after verify-pass.sh check binds them to this run.
       # Only when verify succeeded, and by the artifact id its upload returned, never by name.
@@ -566,6 +687,7 @@ jobs:
             Output directory: ${{ runner.temp }}/pofix-out
             ${{ needs.verify.result == 'success' && format('Verification results file: {0}/pofix-verify/verify.json', runner.temp) || 'Verification did not run: there is no verification results file. Record every example check as not run.' }}
             No AWS profile is named for this run, so the plan pass does not run.
+            Schema page cache, read-only: ${{ runner.temp }}/pofix-schema-cache. The file <namespace>/<name>/<version>/<resources or data-sources>/<type without the provider prefix>.md there, when it exists, is the registry documentation page for that entry; read it as the terraform-module-reviewer large-changes.md Budget says.
             ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
@@ -640,6 +762,46 @@ jobs:
             --mcp-config '{"mcpServers":{"terraform":{"command":"/usr/bin/env","args":["-i","HOME=${{ runner.temp }}/terraform-mcp","PATH=/usr/bin:/bin","${{ runner.temp }}/terraform-mcp/terraform-mcp-server","stdio"]}}}'
             --allowedTools "Skill,Read,Glob,Grep,Bash,mcp__terraform"
             --disallowedTools "Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch"
+
+      # One table of what the run cost, for every run, a failed one included. The execution
+      # file is the action's JSON array of Agent SDK messages; the action writes it outside
+      # the sandbox, also when the run fails. Only the last result message is read, and only
+      # its numbers and its modelUsage keys, which are model ids checked against a pattern:
+      # no prompt, finding, comment or tool text reaches the summary. Field names from the
+      # action's result handling and tests at the pinned SHA; modelUsage holds one entry per
+      # model the run called, so turns and duration are the whole run's on every row. A
+      # missing or unreadable file writes one line instead, and the step never fails the job.
+      - name: Record the token usage
+        if: always()
+        continue-on-error: true
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          rows="" read_ok=""
+          if [ -n "$EXECUTION_FILE" ] && [ -f "$EXECUTION_FILE" ] && [ ! -L "$EXECUTION_FILE" ]; then
+            read_ok=true
+            rows="$(jq -r '
+              def n: if type == "number" and . >= 0 then floor | tostring else "-" end;
+              (last(.[]? | select(type == "object" and .type == "result")) // {}) as $r
+              | ($r.num_turns | n) as $turns | ($r.duration_ms | n) as $ms
+              | ($r.modelUsage // {}) | select(type == "object") | to_entries[]
+              | select(.key | test("^[A-Za-z0-9_.:/@-]{1,120}$"))
+              | .value as $u
+              | "| \(.key) | \($turns) | \($ms) | \($u.inputTokens | n) | \($u.outputTokens | n) | \($u.cacheReadInputTokens | n) | \($u.cacheCreationInputTokens | n) |"
+            ' "$EXECUTION_FILE" 2> /dev/null)" || { rows=""; read_ok=""; }
+          fi
+          {
+            if [ -n "$rows" ]; then
+              echo "| Model | Turns | Duration (ms) | Input | Output | Cache read | Cache write |"
+              echo "|-------|-------|---------------|-------|--------|------------|-------------|"
+              printf '%s\n' "$rows"
+            elif [ -n "$read_ok" ]; then
+              echo "No token usage row: no model id matched the pattern."
+            else
+              echo "No token usage recorded: the review step left no readable execution file."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY" || true
 
       # The agent wrote the output directory, so it is untrusted. upload-artifact follows
       # symbolic links, so only two regular files with one link each are accepted, checked
