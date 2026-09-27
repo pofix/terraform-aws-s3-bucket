@@ -9,8 +9,8 @@ permissions: {}
 jobs:
   debug:
     if: >-
-      (github.event_name == 'issue_comment' && github.event.comment.body == 'oidc-debug' && github.event.comment.author_association == 'OWNER') ||
+      (github.event_name == 'issue_comment' && github.event.comment.body == 'oidc-debug' && contains(fromJSON('["OWNER","MEMBER"]'), github.event.comment.author_association)) ||
       (github.event_name == 'pull_request_target' && github.event.label.name == 'oidc-debug')
     permissions:
       id-token: write
-    uses: pofix/terraform-aws-s3-bucket/.github/workflows/oidc-debug-called.yml@master
+    uses: pofix/terraform-aws-s3-bucket/.github/workflows/oidc-debug-called.yml@23500cb639e977eb54788aa7cf9fd28aafc0a945
