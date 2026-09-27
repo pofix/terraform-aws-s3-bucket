@@ -3,38 +3,70 @@
 # A template to copy, not a live workflow. Copy it into each module repository as
 # .github/workflows/pofix-review.yml, then replace the placeholders:
 #   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
-#   958a162ef6704a83d5aaceea78260f03d00a87ef        the 40-hex commit of that repository to run pr-review.yml from
+#   ebca68fb9852037965411973b880f556d101f7c3        the 40-hex commit of that repository to run pr-review.yml from
 #   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
-#   a54e59a5a2d0c535b8cb090c2f3e24d0e0764d05          the 40-hex commit of the skills to run
+#   730bf418eb0650e3e59c0c832e3a5cba423793e2          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
-# which explains how to pin and upgrade both SHAs.
+# which explains how to pin and upgrade both SHAs. One of them is the organization
+# variable POFIX_MAINTAINERS, the maintainer allowlist: only a user it lists starts a run.
 #
-# GitHub reads this file from the default branch for issue_comment events, so a pull
-# request cannot change it. A comment containing "@pofix" on a pull request starts a run;
-# the reusable workflow checks who wrote it before anything else happens.
+# GitHub reads this file from the default branch for issue_comment and pull_request_target
+# events, so a pull request cannot change it. A comment containing "@pofix" on a pull
+# request starts a run; the reusable workflow checks who wrote it before anything else
+# happens. A comment containing "@pofix full" asks for the full review at once, without the
+# triage first. The pofix-review label starts a run when it is added and on each push while
+# it is on the pull request; the reusable workflow checks who added it, and removes a label
+# a user it refuses added. pull_request_target runs with this repository's secrets even for
+# a fork, so no job here or in the reusable workflow checks out the head.
 
 name: pofix pull request review
+# The run's name carries the commenter's user id, set by GitHub, so the gate of later runs
+# can count a maintainer's runs from the run history. A label run's charged user is in its
+# job names instead.
+run-name: >-
+  ${{ github.event_name == 'issue_comment' && format('pofix review (comment, user {0})', github.event.comment.user.id) || 'pofix review (label)' }}
 
 on:
   issue_comment:
     types: [created]
+  pull_request_target:
+    types: [labeled, synchronize]
 
 permissions: {}
 
 jobs:
   pofix:
-    # The comment body is read only in this if: and in the reusable workflow's gate if:.
+    # The comment body is read only in this if: and in if: conditions of the reusable
+    # workflow's gate job. Another label, or a push to a pull request without the label,
+    # starts nothing.
     if: >-
+      (github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@pofix') &&
-      github.event.comment.user.type == 'User'
+      github.event.comment.user.type == 'User') ||
+      (github.event_name == 'pull_request_target' &&
+      ((github.event.action == 'labeled' && github.event.label.name == 'pofix-review') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'pofix-review'))))
+    # A new push cancels the label run in progress on the same pull request. A comment run
+    # is in a group of its own, so a push never cancels it or replaces it.
+    concurrency:
+      group: >-
+        ${{ github.event_name == 'pull_request_target'
+        && format('pofix-label-{0}-{1}', github.repository, github.event.pull_request.number)
+        || format('pofix-comment-{0}', github.run_id) }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
     permissions:
       contents: read
       pull-requests: read
       id-token: write
-    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@958a162ef6704a83d5aaceea78260f03d00a87ef
+      # Only the reusable workflow's stop job asks for it, to cancel label runs.
+      actions: write
+    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@ebca68fb9852037965411973b880f556d101f7c3
     with:
       skills_repository: pofix/pofix-skills
-      skills_sha: a54e59a5a2d0c535b8cb090c2f3e24d0e0764d05
+      skills_sha: 730bf418eb0650e3e59c0c832e3a5cba423793e2
+      # The maintainer allowlist, passed explicitly so the value the gate checks is visible
+      # here, in the caller, rather than read from the caller's context.
+      maintainers: ${{ vars.POFIX_MAINTAINERS }}
     secrets:
       POFIX_APP_PRIVATE_KEY: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
