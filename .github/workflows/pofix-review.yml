@@ -3,7 +3,7 @@
 # A template to copy, not a live workflow. Copy it into each module repository as
 # .github/workflows/pofix-review.yml, then replace the placeholders:
 #   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
-#   c5777b9ef564e54c47a31f4356e7d5cd161f9686        the 40-hex commit of that repository to run pr-review.yml from
+#   master        the 40-hex commit of that repository to run pr-review.yml from
 #   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
 #   eeff53fc1650e604c8073f2b857fd162dc30b232          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
@@ -61,7 +61,7 @@ jobs:
       id-token: write
       # Only the reusable workflow's stop job asks for it, to cancel label runs.
       actions: write
-    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@c5777b9ef564e54c47a31f4356e7d5cd161f9686
+    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@master
     with:
       skills_repository: pofix/pofix-skills
       skills_sha: eeff53fc1650e604c8073f2b857fd162dc30b232
