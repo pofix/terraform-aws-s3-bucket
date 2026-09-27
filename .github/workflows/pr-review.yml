@@ -424,10 +424,17 @@ jobs:
 
       # Stage 0, deterministic, no model: the head's own checks, read at the SHA pinned
       # above. A check run counts as failed when it is completed with the conclusion
-      # failure, cancelled or timed_out, and is not the host's own check: one named
-      # `pofix review` counts only when GitHub Actions made it, a job of the head's own
-      # workflows, since the gate has no App token to learn this App's slug. The list is GitHub's latest run per name, so a re-run that passed replaces
-      # a failed one. A commit status counts as failed when its latest state for a context
+      # failure, cancelled, timed_out or action_required, the set the skill fails, and is
+      # not the host's own check: one named `pofix review` counts only when GitHub Actions made it, a job of the head's own
+      # workflows, since the gate has no App token to learn this App's slug. Of the runs
+      # left, only the latest run of each check counts, where a check is the pair of name
+      # and app id: the read returns every re-run side by side, each in a check suite of its
+      # own. The latest is the one with the latest started_at, a null started_at (a re-run
+      # still queued) counting as later than any, and on a tie the higher id, the rule the
+      # skill's github-io.md Check Runs states. So a re-run that passed replaces a failed
+      # one, and an older pass does not hide a later failure. All pages are read before
+      # the selection, since two runs of one check can sit on different pages. A commit
+      # status counts as failed when its latest state for a context
       # is failure or error. A check run still queued or in progress, and a pending status,
       # count as not failed: the gate does not wait, and the review reads them as unknown
       # host signals. Any failed one sets stage0=fail: post asks the author, in a fixed
@@ -444,9 +451,10 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          # One count per page; the sums below add them.
-          runs="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/check-runs?per_page=100" \
-            --jq '[.check_runs[] | select(.status == "completed" and (.name != "pofix review" or .app.slug == "github-actions") and (.conclusion | IN("failure", "cancelled", "timed_out")))] | length')"
+          # The check runs of every page, then one count; the statuses give one count per
+          # page, and the sums below add them.
+          runs="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/check-runs?per_page=100" --jq '.check_runs[]' \
+            | jq -s '[.[] | select(.name != "pofix review" or .app.slug == "github-actions")] | group_by([.name, .app.id]) | map(max_by([.started_at == null, .started_at // "", .id])) | [.[] | select(.status == "completed" and (.conclusion | IN("failure", "cancelled", "timed_out", "action_required")))] | length')"
           statuses="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/status?per_page=100" \
             --jq '[.statuses[] | select(.state | IN("failure", "error"))] | length')"
           failed_runs="$(awk '{ s += $1 } END { print s + 0 }' <<< "$runs")"
@@ -821,9 +829,9 @@ jobs:
           fail() { echo "::error::$1"; exit 1; }
           out="$RUNNER_TEMP/feedback"
           mkdir -p "$out"
-          # The first `@pofix feedback`, any case, then the rule ID, a colon and the text.
+          # The first `@pofix feedback`, any case, the rule ID, a colon and the text, trimmed.
           jq -r '(.comment.body // "") | [capture("(?i)@pofix feedback[ \\t]+(?<rule>[^ \\t\\r\\n:]+)[ \\t]*:(?<text>[\\s\\S]*)")] | first | .rule // ""' "$GITHUB_EVENT_PATH" > "$out/rule"
-          jq -j '(.comment.body // "") | [capture("(?i)@pofix feedback[ \\t]+(?<rule>[^ \\t\\r\\n:]+)[ \\t]*:(?<text>[\\s\\S]*)")] | first | .text // ""' "$GITHUB_EVENT_PATH" > "$out/raw"
+          jq -j '(.comment.body // "") | [capture("(?i)@pofix feedback[ \\t]+(?<rule>[^ \\t\\r\\n:]+)[ \\t]*:(?<text>[\\s\\S]*)")] | first | (.text // "") | sub("\\A\\s+"; "") | sub("\\s+\\z"; "")' "$GITHUB_EVENT_PATH" > "$out/raw"
           # Files between the steps, not pipes, so a cut does not break the pipe.
           tr -d '\000-\010\013-\037\177' < "$out/raw" > "$out/clean"
           head -c 4000 "$out/clean" > "$out/text"
@@ -2335,7 +2343,7 @@ jobs:
           set -euo pipefail
           mkdir "$RUNNER_TEMP/pofix-in"
           cat > "$RUNNER_TEMP/pofix-in/comment.md" <<'STAGE0'
-          Not reviewed yet: at least one check on this commit failed, was cancelled or timed out. Please fix the checks first, such as pre-commit and the pull request title check, then ask for a review again with a new `@pofix` comment.
+          Not reviewed yet: at least one check on this commit failed, was cancelled, timed out or needs action. Please fix the checks first, such as pre-commit and the pull request title check, then ask for a review again with a new `@pofix` comment.
 
           No model ran for this request.
           STAGE0
