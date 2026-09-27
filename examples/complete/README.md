@@ -73,6 +73,3 @@ No inputs.
 | <a name="output_s3_bucket_website_domain"></a> [s3\_bucket\_website\_domain](#output\_s3\_bucket\_website\_domain) | The domain of the website endpoint, if the bucket is configured with a website. This is used to create Route 53 alias records |
 | <a name="output_s3_bucket_website_endpoint"></a> [s3\_bucket\_website\_endpoint](#output\_s3\_bucket\_website\_endpoint) | The website endpoint, if the bucket is configured with a website |
 <!-- END_TF_DOCS -->
-
-<!-- pilot push 1 -->
-<!-- pilot push 2 -->
