@@ -1,0 +1,136 @@
+# Pofix schema page cache: the warm workflow for one module repository. Optional.
+#
+# A template to copy, not a live workflow. Copy it into each module repository that runs
+# the review as .github/workflows/pofix-schema-cache.yml. It has no placeholder to fill.
+#
+# It is the only writer of the schema page cache the review reads. It runs only on
+# schedule and workflow_dispatch, only on the default branch, with contents: read and
+# nothing else: no secret, no App token, no id-token, no AWS credential and no model. It
+# reads the default branch's own .tf files, never pull request code, and fetches every
+# page from the Terraform registry itself. It never restores the cache first: each run
+# builds the cache from scratch, so a false page does not outlive the next run.
+# Without this workflow the review still runs; every page is then a miss, which changes
+# cost only. How it works and why: ci/github/README.md, section Schema page cache.
+#
+# Items marked [verify] are assumptions the live pilot must confirm.
+
+name: pofix schema page cache
+
+on:
+  schedule:
+    - cron: '23 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  warm:
+    # A schedule run is always on the default branch; a manual run must be too, so that it
+    # saves into the default branch's cache scope, the one the review reads. [verify]
+    if: github.event_name == 'schedule' || github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    # Save only: the platform refuses a restore in this job, so no page outlives a run.
+    cache-mode: write-only
+    concurrency:
+      group: pofix-schema-cache-${{ github.repository }}
+      cancel-in-progress: false
+    env:
+      # The same pattern as in pr-review.yml.template; tests/ci-workflow-test.sh keeps
+      # the two equal. The key prefix and its format version must match too.
+      SCHEMA_PAGE_RE: '^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}/[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}/(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md$'
+      MAX_PAGES: 400
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      # Keys come from the module's own code, read as text and never run:
+      # - every resource "<type>" and data "<type>" block type in every tracked .tf file,
+      #   root, modules/ and examples/ alike;
+      # - the provider of a type is the source ("<namespace>/<name>") of a
+      #   required_providers entry whose name is the type's prefix up to the first "_";
+      #   only a multi-line entry ("aws = {" with source and version on their own lines)
+      #   is read, so a one-line entry leaves that provider's pages as misses, and a type
+      #   with no entry read is skipped;
+      # - the versions are the latest release in the registry, plus, for each version
+      #   constraint of that provider in any required_providers entry, the lowest release
+      #   at or above its highest lower bound (">=", ">", "~>", "=" or a bare version);
+      #   a constraint with no lower bound is skipped.
+      # Each provider name is checked before its first registry call, and each page path
+      # against SCHEMA_PAGE_RE before its fetch. The pages are fetched with the calls the
+      # Terraform MCP server 1.3.0 makes: the v1 document list, then the v2 document.
+      - name: Fetch the schema pages
+        id: pages
+        run: |
+          set -uo pipefail
+          set -f
+          save="$RUNNER_TEMP/pofix-schema-save"
+          work="$RUNNER_TEMP/pofix-schema-work"
+          mkdir "$save" "$work" || exit 1
+          reg() { curl -fsS -g --proto '=https' --max-time 30 --max-filesize 50000000 "https://registry.terraform.io/$1"; }
+          name_re='^[a-z0-9][a-z0-9-]{0,63}$'
+          git ls-files -z -- '*.tf' | xargs -0 -r awk '
+            function flush() { if (src != "") print "P", src, ver; src = ""; ver = "" }
+            /^[[:space:]]*(resource|data)[[:space:]]+"[a-z0-9_]+"/ { match($0, /"[a-z0-9_]+"/); print "T", $1, substr($0, RSTART + 1, RLENGTH - 2) }
+            /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=[[:space:]]*\{[[:space:]]*$/ { flush(); inobj = 1; next }
+            inobj && /^[[:space:]]*source[[:space:]]*=/ { s = $0; sub(/^[^"]*"/, "", s); sub(/".*/, "", s); sub(/^registry\.terraform\.io\//, "", s); src = tolower(s) }
+            inobj && /^[[:space:]]*version[[:space:]]*=/ { v = $0; sub(/^[^"]*"/, "", v); sub(/".*/, "", v); gsub(/[[:space:]]/, "", v); ver = v }
+            inobj && /^[[:space:]]*\}/ { flush(); inobj = 0 }
+            END { flush() }' > "$work/scan"
+          n=0
+          for pr in $(awk '$1 == "P" { print $2 }' "$work/scan" | sort -u); do
+            ns="${pr%%/*}" name="${pr#*/}"
+            [[ "$pr" == */* && "$ns" =~ $name_re && "$name" =~ $name_re ]] || continue
+            reg "v1/providers/$ns/$name/versions" | jq -r '.versions[]?.version' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV > "$work/versions"
+            [ -s "$work/versions" ] || { echo "::notice::no release list for $pr"; continue; }
+            vers="$(tail -n 1 "$work/versions")"
+            for c in $(awk -v p="$pr" '$1 == "P" && $2 == p && NF == 3 { print $3 }' "$work/scan" | sort -u); do
+              b="$(printf '%s\n' "${c//,/$'\n'}" | sed -nE 's/^(>=|~>|=|>)?v?([0-9]+(\.[0-9]+){0,2})$/\2/p' | sort -V | tail -n 1)"
+              [ -n "$b" ] || { echo "::notice::the constraint $c of $pr has no lower bound; skipped"; continue; }
+              while [[ ! "$b" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; do b="$b.0"; done
+              f="$( { echo "$b"; cat "$work/versions"; } | sort -V | grep -A1 -xF -- "$b" | grep -vxF -- "$b" | head -n 1)"
+              grep -qxF -- "$b" "$work/versions" && f="$b"
+              [ -n "$f" ] && vers="$vers $f"
+            done
+            for ver in $(printf '%s\n' $vers | awk '!seen[$0]++'); do
+              list="$work/list.json"
+              rm -f "$list"
+              while read -r kind type; do
+                slug="${type#"${name}_"}"
+                [ "$slug" != "$type" ] || continue
+                cat=resources
+                [ "$kind" = data ] && cat=data-sources
+                p="$ns/$name/$ver/$cat/$slug.md"
+                [[ "$p" =~ $SCHEMA_PAGE_RE ]] || continue
+                [ -e "$save/$p" ] && continue
+                [ "$n" -lt "$MAX_PAGES" ] || { echo "::warning::the cap of $MAX_PAGES pages is reached; the rest are misses"; break 3; }
+                if [ ! -f "$list" ]; then
+                  reg "v1/providers/$ns/$name/$ver" > "$list" || { echo "::notice::no document list for $pr $ver"; break; }
+                fi
+                id="$(jq -r --arg c "$cat" --arg t "$slug" '[.docs[]? | select(.language == "hcl" and .category == $c and .title == $t) | .id] | if length == 1 then .[0] else "" end' "$list")" || continue
+                [[ "$id" =~ ^[0-9]{1,12}$ ]] || continue
+                n=$((n + 1))
+                reg "v2/provider-docs/$id" > "$work/doc.json" || continue
+                jq -e -j --arg id "$id" --arg c "$cat" '.data | select(.id == $id and .attributes.category == $c and .attributes.language == "hcl")
+                  | .attributes.content | select(type == "string" and length > 0)' "$work/doc.json" > "$work/page.md" || continue
+                mkdir -p "$save/${p%/*}" && mv -- "$work/page.md" "$save/$p"
+              done < <(awk '$1 == "T" { print $2, $3 }' "$work/scan" | sort -u)
+            done
+          done
+          pages="$(find "$save" -type f | wc -l)"
+          echo "schema pages fetched: $pages"
+          echo "pages=$pages" >> "$GITHUB_OUTPUT"
+
+      # A new key every run; the review restores the newest by the prefix. The prefix and
+      # its format version are the ones pr-review.yml.template restores.
+      - name: Save the schema page cache
+        if: steps.pages.outputs.pages != '' && steps.pages.outputs.pages != '0'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/pofix-schema-save
+          key: pofix-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}
