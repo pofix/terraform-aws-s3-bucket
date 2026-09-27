@@ -287,16 +287,16 @@ jobs:
 
       # The run budget. Runs are counted from this repository's history of the caller
       # workflow this month (UTC), with no other store. A run counts when its triage or full
-      # review job started. Those jobs are named `triage (user <id>)` and `review (user <id>)`
+      # review job ran on a runner. Those jobs are named `triage (user <id>)` and `review (user <id>)`
       # from the gate's charged user, and the caller's run-name carries a comment run's
       # commenter, so only the comment runs of the charged user have their jobs read; every
       # label run's jobs are read, across all attempts. Skipped runs are not listed. The
-      # listings and the job reads are capped: a longer history, a triage or review job name
-      # in an unexpected form, or any API error, fails the gate, and nothing runs. A run from
-      # before this version, whose jobs lack the charged user, is not counted. This run counts as used
-      # unless it is a budget command. A label run also counts the pull request's label runs
-      # today (UTC), against a limit of 10. The reads work on a public repository with no
-      # permission. [verify] that the jobs API returns the evaluated job names.
+      # listings and the job reads are capped: a longer history, the name of a triage or review
+      # job that ran on a runner in an unexpected form, or any API error, fails the gate, and
+      # nothing runs. A run from before this version, whose jobs lack the charged user, is not
+      # counted. This run counts as used unless it is a budget command. A label run also counts
+      # the pull request's label runs today (UTC), against a limit of 10. The reads work on a
+      # public repository with no permission. [verify] that the jobs API returns the evaluated names of jobs that ran.
       - name: Count the runs
         id: count
         if: steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback'
@@ -355,16 +355,20 @@ jobs:
           }
           list issue_comment
           list pull_request_target
-          # The users a run is charged to: the ids in the names of its triage and review jobs
-          # that started, in any attempt, so a re-run does not erase an earlier attempt. A
-          # skipped job, or one cancelled before it started, does not count. A triage or
-          # review job whose name is not in the expected form fails the gate: the count
-          # would otherwise miss it.
+          # charged sets users to the ids in the names of a run's triage and review jobs that
+          # ran on a runner, in any attempt, so a re-run does not erase an earlier attempt. A
+          # skipped job, or one cancelled before a runner took it, made no model call and
+          # does not count: the API lists it with started_at set, no runner_id, no steps and
+          # its name unevaluated. A job that ran with a name not in the expected form fails
+          # the gate: the count would otherwise miss it. charged runs in this shell, never in
+          # a command substitution, so the ::error line of its fail reaches the log.
+          # The pilot showed that a job that ran on a hosted runner keeps its runner_id, even if cancelled.
           jobs_read=0
           charged() {
             local names name
+            users=""
             names="$(gh api --paginate "repos/$REPOSITORY/actions/runs/$1/jobs?filter=all&per_page=100" \
-              --jq '.jobs[] | select(.started_at != null and (.status == "in_progress" or (.status == "completed" and .conclusion != "skipped"))) | .name')"
+              --jq '.jobs[] | select(.started_at != null and .runner_id != null and (.status == "in_progress" or (.status == "completed" and .conclusion != "skipped"))) | .name')"
             while IFS= read -r name; do
               name="${name#pofix / }"
               case "$name" in
@@ -373,7 +377,7 @@ jobs:
                 triage|review) ;;
                 triage*|review*)
                   [[ "$name" =~ ^(triage|review)\ \(user\ ([1-9][0-9]*)\)$ ]] || fail "a triage or review job name is not in the expected form; the runs cannot be counted, nothing runs"
-                  echo "${BASH_REMATCH[2]}" ;;
+                  users+="${BASH_REMATCH[2]}"$'\n' ;;
               esac
             done <<< "$names"
           }
@@ -391,7 +395,7 @@ jobs:
             fi
             jobs_read=$((jobs_read + 1))
             [ "$jobs_read" -le "$MAX_JOB_READS" ] || fail "more than $MAX_JOB_READS runs to read, too many to count; nothing runs"
-            users="$(charged "$id" | sort -u)"
+            charged "$id"
             if grep -qxF -- "$CHARGED_USER_ID" <<< "$users"; then used=$((used + 1)); fi
           done < "$RUNNER_TEMP/runs-issue_comment"
           while IFS=$'\t' read -r id created title hrepo hbranch; do
@@ -400,7 +404,7 @@ jobs:
             if [[ "$title" =~ $comment_title_re ]]; then continue; fi
             jobs_read=$((jobs_read + 1))
             [ "$jobs_read" -le "$MAX_JOB_READS" ] || fail "more than $MAX_JOB_READS runs to read, too many to count; nothing runs"
-            users="$(charged "$id" | sort -u)"
+            charged "$id"
             [ -n "$users" ] || continue
             if grep -qxF -- "$CHARGED_USER_ID" <<< "$users"; then used=$((used + 1)); fi
             if [ "$hrepo" = "$head_repo" ] && [ "$hbranch" = "$head_ref" ] && [ "${created:0:10}" = "$today" ]; then
@@ -1129,8 +1133,26 @@ jobs:
           sudo rm -f /etc/sudoers.d/runner
           if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
 
+      # setup-terraform has no retry input and does not retry its release lookup. A first
+      # attempt that fails or runs past its 5 minute timeout gets one more after a pause,
+      # with the same action and version; a second failure fails the job, as one did before.
       - name: Install Terraform
+        id: install-terraform
         if: steps.workspace.outputs.head_moved == 'false'
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.4
+          terraform_wrapper: false
+
+      - name: Wait before the second Terraform install attempt
+        if: steps.workspace.outputs.head_moved == 'false' && steps.install-terraform.outcome == 'failure'
+        run: sleep 30
+
+      - name: Install Terraform, second attempt
+        if: steps.workspace.outputs.head_moved == 'false' && steps.install-terraform.outcome == 'failure'
+        timeout-minutes: 5
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
           terraform_version: 1.16.4
