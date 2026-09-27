@@ -1,0 +1,18 @@
+# Temporary: prints the OIDC subject claims of a reusable-workflow job. Remove after the pilot.
+name: oidc debug (called)
+on:
+  workflow_call:
+permissions: {}
+jobs:
+  claims:
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+    steps:
+      - name: Print the subject claims
+        run: |
+          set -euo pipefail
+          tok="$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r .value)"
+          p="$(printf '%s' "$tok" | cut -d. -f2 | tr '_-' '/+')"
+          while [ $(( ${#p} % 4 )) -ne 0 ]; do p="$p="; done
+          printf '%s' "$p" | base64 -d | jq '{sub, context, job_workflow_ref, event_name, ref}'

@@ -1,0 +1,16 @@
+# Temporary: calls oidc-debug-called.yml on a comment or label to print OIDC claims. Remove after the pilot.
+name: oidc debug
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [labeled]
+permissions: {}
+jobs:
+  debug:
+    if: >-
+      (github.event_name == 'issue_comment' && github.event.comment.body == 'oidc-debug' && github.event.comment.author_association == 'OWNER') ||
+      (github.event_name == 'pull_request_target' && github.event.label.name == 'oidc-debug')
+    permissions:
+      id-token: write
+    uses: pofix/terraform-aws-s3-bucket/.github/workflows/oidc-debug-called.yml@master
