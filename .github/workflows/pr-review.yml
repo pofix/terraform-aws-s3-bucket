@@ -144,6 +144,9 @@ jobs:
       charged_limit: ${{ steps.check.outputs.charged_limit }}
       # pass or fail, nothing else: a model job runs only on pass.
       stage0: ${{ steps.stage0.outputs.stage0 }}
+      # The check runs of this workflow's own jobs on the head, as <check run id>:<suite id>
+      # pairs separated by spaces, checked against that grammar; empty on a first run.
+      own_pairs: ${{ steps.own-checks.outputs.pairs }}
       # true only when the step below ran, which only its if: decides.
       full_requested: ${{ steps.mode.outputs.full == 'true' }}
       # The schema job's needs, each value checked against a strict pattern; empty when
@@ -426,11 +429,123 @@ jobs:
             echo "label_runs_today=$today_runs"
           } >> "$GITHUB_OUTPUT"
 
+      # The host's own check runs, so neither stage 0 nor the review reads this workflow's own
+      # jobs as checks of the head. A label run attaches its job check runs, `pofix / gate`
+      # and the rest, to the head, made by GitHub Actions like any workflow's jobs, so a name
+      # or an App cannot tell them apart. They are found as pairs instead: the check run id
+      # of each job the jobs API lists for an attempt, the last segment of its check_run_url,
+      # with that attempt's check suite id. A whole suite is never dropped: a check run a
+      # step makes through the Checks API with its job token can land in one of these
+      # suites. Only this repository's caller file is supported, and only its runs are left
+      # out: other workflows' check runs count. The earlier runs are this caller workflow's
+      # runs for the head with the event pull_request_target, which always run the base
+      # branch's caller file, every page of them, this run left out, every attempt of each;
+      # a label run that a stop, a new label or a re-run replaced leaves cancelled or failed
+      # jobs on the head. This run is read by its own id, every attempt up to this one, whose
+      # jobs so far are this gate job alone: jobs are created only when their needs resolve.
+      # Dropping the live gate job keeps it from hiding an earlier failure of the same name.
+      # The gate job's own check run is read back and must sit in the suite its pair names.
+      # Comment runs attach their jobs to the default branch and are not listed. A job
+      # without a check run URL, a missing attempt, an id in another form, more than 50
+      # earlier runs, 100 attempts, 1000 pairs or 300 API requests, pages included, or any
+      # API error fails the gate, and nothing runs; there is no retry.
+      - name: Find the host's own check runs
+        id: own-checks
+        if: steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback' && steps.verb-budget.outputs.verb != 'budget' && steps.count.outputs.budget == 'ok'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ steps.check.outputs.repository }}
+          GATE_HEAD: ${{ steps.check.outputs.head_sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          MAX_RUNS=50
+          MAX_ATTEMPTS=100
+          MAX_PAIRS=1000
+          MAX_REQUESTS=300
+          requests=0 attempts=0 npairs=0 pairs="" gate_urls="" current_suite=""
+          request() { # counts one API request against the cap, before it is made
+            requests=$((requests + 1))
+            [ "$requests" -le "$MAX_REQUESTS" ] || fail "more than $MAX_REQUESTS API requests to find the host's own check runs; nothing runs"
+          }
+          [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || fail "unexpected run id or attempt"
+          path="${WORKFLOW_REF#"$REPOSITORY"/}"; path="${path%%@*}"
+          [[ "$path" =~ ^\.github/workflows/[A-Za-z0-9._-]+\.ya?ml$ ]] || fail "the caller workflow is not a file of this repository; nothing runs"
+          file="${path##*/}"
+          # One attempt: its check suite, then every page of its jobs, each job's check run id
+          # paired with the suite. An attempt with no jobs gives no pair.
+          read_attempt() { # run id, attempt
+            local suite page jobs total urls url
+            attempts=$((attempts + 1))
+            [ "$attempts" -le "$MAX_ATTEMPTS" ] || fail "more than $MAX_ATTEMPTS attempts to read; nothing runs"
+            request
+            suite="$(gh api "repos/$REPOSITORY/actions/runs/$1/attempts/$2" --jq '.check_suite_id')"
+            [[ "$suite" =~ ^[1-9][0-9]*$ ]] || fail "unexpected check suite id"
+            page=1
+            while :; do
+              request
+              jobs="$(gh api "repos/$REPOSITORY/actions/runs/$1/attempts/$2/jobs?per_page=100&page=$page")"
+              total="$(jq -r '.total_count' <<< "$jobs")"
+              [[ "$total" =~ ^[0-9]+$ ]] || fail "unexpected job count"
+              urls="$(jq -r '.jobs[] | .check_run_url // "-"' <<< "$jobs")"
+              while IFS= read -r url; do
+                [ -n "$url" ] || continue
+                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]] || fail "a job without a check run URL, or one in an unexpected form; nothing runs"
+                npairs=$((npairs + 1))
+                [ "$npairs" -le "$MAX_PAIRS" ] || fail "more than $MAX_PAIRS own check runs; nothing runs"
+                pairs="${pairs:+$pairs }${BASH_REMATCH[1]}:$suite"
+              done <<< "$urls"
+              if [ "$1" = "$RUN_ID" ] && [ "$2" = "$RUN_ATTEMPT" ]; then
+                current_suite="$suite"
+                gate_urls+="$(jq -r --arg runner "$RUNNER_NAME" '.jobs[] | select(.status == "in_progress" and .runner_name == $runner) | .check_run_url // "-"' <<< "$jobs")"$'\n'
+              fi
+              [ $((page * 100)) -lt "$total" ] || break
+              page=$((page + 1))
+            done
+          }
+          # The earlier runs: every page of the list, this run left out, then the cap.
+          earlier="" page=1
+          while :; do
+            request
+            list="$(gh api "repos/$REPOSITORY/actions/workflows/$file/runs?event=pull_request_target&head_sha=$GATE_HEAD&per_page=100&page=$page")"
+            total="$(jq -r '.total_count' <<< "$list")"
+            [[ "$total" =~ ^[0-9]+$ ]] || fail "unexpected run count"
+            earlier+="$(jq -r --arg self "$RUN_ID" '.workflow_runs[] | select((.id | tostring) != $self) | "\(.id) \(.run_attempt)"' <<< "$list")"$'\n'
+            [ $((page * 100)) -lt "$total" ] || break
+            page=$((page + 1))
+          done
+          runs="$(awk 'NF' <<< "$earlier" | wc -l | tr -d ' ')"
+          [ "$runs" -le "$MAX_RUNS" ] || fail "more than $MAX_RUNS earlier label runs on this head commit; nothing runs"
+          while read -r id attempt; do
+            [ -n "$id" ] || continue
+            [[ "$id" =~ ^[1-9][0-9]*$ && "$attempt" =~ ^[1-9][0-9]*$ ]] || fail "unexpected run id or attempt"
+            for ((a = 1; a <= attempt; a++)); do read_attempt "$id" "$a"; done
+          done <<< "$earlier"
+          # This run, by its own id, every attempt up to this one.
+          for ((a = 1; a <= RUN_ATTEMPT; a++)); do read_attempt "$RUN_ID" "$a"; done
+          # The gate job's own check run is in the suite its pair names, or nothing runs.
+          gate_url="$(awk 'NF' <<< "$gate_urls")"
+          [ "$(wc -l <<< "$gate_url" | tr -d ' ')" = 1 ] && [[ "$gate_url" =~ /check-runs/([1-9][0-9]*)$ ]] ||
+            fail "this gate job is not listed once with a check run URL; nothing runs"
+          gate_run="${BASH_REMATCH[1]}"
+          request
+          [ "$(gh api "repos/$REPOSITORY/check-runs/$gate_run" --jq '.check_suite.id')" = "$current_suite" ] ||
+            fail "this gate job's check run is not in its attempt's check suite; nothing runs"
+          [[ -z "$pairs" || "$pairs" =~ ^[1-9][0-9]*:[1-9][0-9]*( [1-9][0-9]*:[1-9][0-9]*)*$ ]] || fail "unexpected own check run pairs"
+          summary="own check runs: $runs earlier label runs on the head, $attempts attempts, $requests API requests, $npairs check run pairs"
+          echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "pairs=$pairs" >> "$GITHUB_OUTPUT"
+
       # Stage 0, deterministic, no model: the head's own checks, read at the SHA pinned
       # above. A check run counts as failed when it is completed with the conclusion
       # failure, cancelled, timed_out or action_required, the set the skill fails, and is
-      # not the host's own check: one named `pofix review` counts only when GitHub Actions made it, a job of the head's own
-      # workflows, since the gate has no App token to learn this App's slug. Of the runs
+      # not one of the host's own job check runs above, by the pair of id and check suite,
+      # and not the host's own check: one named `pofix review` counts only when GitHub
+      # Actions made it, a job of the head's own workflows, since the gate has no App token
+      # to learn this App's slug. Of the runs
       # left, only the latest run of each check counts, where a check is the pair of name
       # and app id: the read returns every re-run side by side, each in a check suite of its
       # own. The latest is the one with the latest started_at, a null started_at (a re-run
@@ -452,19 +567,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ steps.check.outputs.repository }}
           GATE_HEAD: ${{ steps.check.outputs.head_sha }}
+          OWN_PAIRS: ${{ steps.own-checks.outputs.pairs }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          # The check runs of every page, then one count; the statuses give one count per
-          # page, and the sums below add them.
-          runs="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/check-runs?per_page=100" --jq '.check_runs[]' \
-            | jq -s '[.[] | select(.name != "pofix review" or .app.slug == "github-actions")] | group_by([.name, .app.id]) | map(max_by([.started_at == null, .started_at // "", .id])) | [.[] | select(.status == "completed" and (.conclusion | IN("failure", "cancelled", "timed_out", "action_required")))] | length')"
+          [[ -z "$OWN_PAIRS" || "$OWN_PAIRS" =~ ^[1-9][0-9]*:[1-9][0-9]*( [1-9][0-9]*:[1-9][0-9]*)*$ ]] || fail "unexpected own check run pairs"
+          # Every page of check runs first, then the selection and the count of dropped own
+          # jobs over all of them; the statuses give one count per page, and the sums below
+          # add them.
+          checks="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/check-runs?per_page=100" --jq '.check_runs[]' | jq -s '.')"
+          dropped="$(jq --arg pairs "$OWN_PAIRS" '($pairs | split(" ") | map(select(. != ""))) as $own | [.[] | select("\(.id):\(.check_suite.id)" | IN($own[]))] | length' <<< "$checks")"
+          runs="$(jq --arg pairs "$OWN_PAIRS" '($pairs | split(" ") | map(select(. != ""))) as $own | [.[] | select("\(.id):\(.check_suite.id)" | IN($own[]) | not) | select(.name != "pofix review" or .app.slug == "github-actions")] | group_by([.name, .app.id]) | map(max_by([.started_at == null, .started_at // "", .id])) | [.[] | select(.status == "completed" and (.conclusion | IN("failure", "cancelled", "timed_out", "action_required")))] | length' <<< "$checks")"
           statuses="$(gh api --paginate "repos/$REPOSITORY/commits/$GATE_HEAD/status?per_page=100" \
             --jq '[.statuses[] | select(.state | IN("failure", "error"))] | length')"
           failed_runs="$(awk '{ s += $1 } END { print s + 0 }' <<< "$runs")"
           failed_statuses="$(awk '{ s += $1 } END { print s + 0 }' <<< "$statuses")"
-          [[ "$failed_runs" =~ ^[0-9]+$ && "$failed_statuses" =~ ^[0-9]+$ ]] || fail "unexpected check counts"
-          echo "stage 0: $failed_runs failed check runs, $failed_statuses failed commit statuses"
+          [[ "$failed_runs" =~ ^[0-9]+$ && "$failed_statuses" =~ ^[0-9]+$ && "$dropped" =~ ^[0-9]+$ ]] || fail "unexpected check counts"
+          summary="stage 0: $failed_runs failed check runs, $failed_statuses failed commit statuses, $dropped own job check runs dropped"
+          echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
           if [ "$failed_runs" -eq 0 ] && [ "$failed_statuses" -eq 0 ]; then
             echo "stage0=pass" >> "$GITHUB_OUTPUT"
           else
@@ -1554,6 +1674,75 @@ jobs:
           sudo rm -f /etc/sudoers.d/runner
           if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
 
+      # This attempt's own jobs, read afresh just before the model runs and joined to the
+      # gate's pairs: the check runs the skill drops, by the pair of id and check suite. A
+      # job not listed yet has no check run on the head. Every read runs in a subshell; any
+      # failure there, a job without a check run URL, a pair in another form, more than 300
+      # API requests or 1000 pairs gives the fixed line that the host's own check runs could
+      # not be read, which the skill reads as an unknown Checks signal: the job goes on, and
+      # the review is inconclusive rather than misled by its own jobs. The line goes into
+      # the prompt inside a host block whose markers carry a nonce drawn for this run, so
+      # the skill can tell it from the same text in the pull request or a file.
+      - name: List the host's own check runs
+        id: own-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_PAIRS: ${{ needs.gate.outputs.own_pairs }}
+        run: |
+          set -euo pipefail
+          MAX_REQUESTS=300
+          MAX_PAIRS=1000
+          pairs_re='^[1-9][0-9]*:[1-9][0-9]*( [1-9][0-9]*:[1-9][0-9]*)*$'
+          collect() ( # -> "<requests> <pairs>"; exits non-zero on any fault
+            set -euo pipefail
+            requests=1 page=1 all="$GATE_PAIRS"
+            [[ -z "$all" || "$all" =~ $pairs_re ]]
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+            suite="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" --jq '.check_suite_id')"
+            [[ "$suite" =~ ^[1-9][0-9]*$ ]]
+            while :; do
+              requests=$((requests + 1))
+              [ "$requests" -le "$MAX_REQUESTS" ]
+              jobs="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100&page=$page")"
+              total="$(jq -r '.total_count' <<< "$jobs")"
+              [[ "$total" =~ ^[0-9]+$ ]]
+              urls="$(jq -r '.jobs[] | .check_run_url // "-"' <<< "$jobs")"
+              while IFS= read -r url; do
+                [ -n "$url" ] || continue
+                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]]
+                all="${all:+$all }${BASH_REMATCH[1]}:$suite"
+              done <<< "$urls"
+              [ $((page * 100)) -lt "$total" ] || break
+              page=$((page + 1))
+            done
+            [ "$(wc -w <<< "$all")" -le "$MAX_PAIRS" ]
+            [[ "$all" =~ $pairs_re ]]
+            echo "$requests $all"
+          )
+          # Outside any condition, so set -e holds inside the subshell.
+          set +e; out="$(collect)"; status=$?; set -e
+          if [ "$status" = 0 ]; then
+            line="The host's own check runs: \`${out#* }\`."
+            summary="own check runs: ${out%% *} API requests, $(wc -w <<< "${out#* }" | tr -d ' ') check run pairs"
+          else
+            line="The host's own check runs could not be read."
+            summary="own check runs: could not be read; the review reads the Checks signal as unknown"
+            echo "::warning::$summary"
+          fi
+          nonce="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "$nonce" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::no nonce for the host block"; exit 1; }
+          # The prompt input is echoed in the public job log; the mask keeps the nonce out of it.
+          echo "::add-mask::$nonce"
+          echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "start=<<<pofix-host-signals $nonce>>>"
+            echo "line=$line"
+            echo "end=<<<end-pofix-host-signals $nonce>>>"
+          } >> "$GITHUB_OUTPUT"
+
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
       # sandbox.credentials unsets them for sandboxed Bash only; the Read deny rules and
@@ -1579,8 +1768,9 @@ jobs:
           github_token: ${{ steps.read-token.outputs.token }}
           # The prompt is built from the gate outputs, the output directory and the App slug
           # only. The mode line is this workflow's own fixed text, never copied from the pull
-          # request or a comment: it is what makes this run a triage. The last line names
-          # the host's own check, so the skill does not read it as a signal about the change.
+          # request or a comment: it is what makes this run a triage. The last lines name the
+          # host's own check and, in the nonce-marked host block, the check runs of this
+          # workflow's own jobs, so the skill does not read them as signals about the change.
           prompt: |
             Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
             mode: triage
@@ -1588,6 +1778,9 @@ jobs:
             This is a hosted run with no local conversation, so it is render-only. Do not post anything to GitHub.
             Output directory: ${{ runner.temp }}/pofix-out
             ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
+            ${{ steps.own-checks.outputs.start }}
+            ${{ steps.own-checks.outputs.line }}
+            ${{ steps.own-checks.outputs.end }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
           # docs, the same as the review job's. No Terraform host is allowed: this job runs
@@ -2090,6 +2283,75 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "lead model $LEAD_MODEL, W $window tokens, fetch helper model $helper"
 
+      # This attempt's own jobs, read afresh just before the model runs and joined to the
+      # gate's pairs: the check runs the skill drops, by the pair of id and check suite. A
+      # job not listed yet has no check run on the head. Every read runs in a subshell; any
+      # failure there, a job without a check run URL, a pair in another form, more than 300
+      # API requests or 1000 pairs gives the fixed line that the host's own check runs could
+      # not be read, which the skill reads as an unknown Checks signal: the job goes on, and
+      # the review is inconclusive rather than misled by its own jobs. The line goes into
+      # the prompt inside a host block whose markers carry a nonce drawn for this run, so
+      # the skill can tell it from the same text in the pull request or a file.
+      - name: List the host's own check runs
+        id: own-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          GATE_PAIRS: ${{ needs.gate.outputs.own_pairs }}
+        run: |
+          set -euo pipefail
+          MAX_REQUESTS=300
+          MAX_PAIRS=1000
+          pairs_re='^[1-9][0-9]*:[1-9][0-9]*( [1-9][0-9]*:[1-9][0-9]*)*$'
+          collect() ( # -> "<requests> <pairs>"; exits non-zero on any fault
+            set -euo pipefail
+            requests=1 page=1 all="$GATE_PAIRS"
+            [[ -z "$all" || "$all" =~ $pairs_re ]]
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+            suite="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" --jq '.check_suite_id')"
+            [[ "$suite" =~ ^[1-9][0-9]*$ ]]
+            while :; do
+              requests=$((requests + 1))
+              [ "$requests" -le "$MAX_REQUESTS" ]
+              jobs="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100&page=$page")"
+              total="$(jq -r '.total_count' <<< "$jobs")"
+              [[ "$total" =~ ^[0-9]+$ ]]
+              urls="$(jq -r '.jobs[] | .check_run_url // "-"' <<< "$jobs")"
+              while IFS= read -r url; do
+                [ -n "$url" ] || continue
+                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]]
+                all="${all:+$all }${BASH_REMATCH[1]}:$suite"
+              done <<< "$urls"
+              [ $((page * 100)) -lt "$total" ] || break
+              page=$((page + 1))
+            done
+            [ "$(wc -w <<< "$all")" -le "$MAX_PAIRS" ]
+            [[ "$all" =~ $pairs_re ]]
+            echo "$requests $all"
+          )
+          # Outside any condition, so set -e holds inside the subshell.
+          set +e; out="$(collect)"; status=$?; set -e
+          if [ "$status" = 0 ]; then
+            line="The host's own check runs: \`${out#* }\`."
+            summary="own check runs: ${out%% *} API requests, $(wc -w <<< "${out#* }" | tr -d ' ') check run pairs"
+          else
+            line="The host's own check runs could not be read."
+            summary="own check runs: could not be read; the review reads the Checks signal as unknown"
+            echo "::warning::$summary"
+          fi
+          nonce="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
+          [[ "$nonce" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::no nonce for the host block"; exit 1; }
+          # The prompt input is echoed in the public job log; the mask keeps the nonce out of it.
+          echo "::add-mask::$nonce"
+          echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "start=<<<pofix-host-signals $nonce>>>"
+            echo "line=$line"
+            echo "end=<<<end-pofix-host-signals $nonce>>>"
+          } >> "$GITHUB_OUTPUT"
+
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
       # sandbox.credentials unsets them for sandboxed Bash only; the Read deny rules and
@@ -2115,8 +2377,9 @@ jobs:
           github_token: ${{ steps.read-token.outputs.token }}
           # The prompt is built from the gate outputs, the output directory, the App slug and
           # the versions line the fact sheets check wrote from a versions.json of the exact
-          # shape it checks, directory names and versions only. The last line names the
-          # host's own check, so the skill does not read it as a signal about the change.
+          # shape it checks, directory names and versions only. The last lines name the
+          # host's own check and, in the nonce-marked host block, the check runs of this
+          # workflow's own jobs, so the skill does not read them as signals about the change.
           prompt: |
             Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
             The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
@@ -2130,6 +2393,9 @@ jobs:
             Provider fact sheets, read-only: ${{ runner.temp }}/pofix-schema-facts, as the terraform-module-reviewer large-changes.md Budget describes: <namespace>/<name>/<version>/index.json there says for each type whether it is a sheet, absent or page, and a sheet is the file <resources or data-sources>/<type>.facts beside it.
             ${{ steps.facts-check.outputs.versions != '' && format('Provider versions per directory, from the host, as the Budget reads them: {0}', steps.facts-check.outputs.versions) || 'The host gives no provider versions: resolve them as the Budget says.' }}
             ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
+            ${{ steps.own-checks.outputs.start }}
+            ${{ steps.own-checks.outputs.line }}
+            ${{ steps.own-checks.outputs.end }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
           # docs. The Read deny rules apply to Read and, best effort, to Glob and Grep; the
