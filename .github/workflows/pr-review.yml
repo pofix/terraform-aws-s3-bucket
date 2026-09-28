@@ -1450,14 +1450,16 @@ jobs:
       # issue_comment the default branch's cache is read-only. The key carries the format
       # version: v1 is the page layout in SCHEMA_PAGE_RE and the page bytes as the
       # registry's provider-docs content field. Change either, here and in the warm
-      # workflow together, and bump it. POFIX_SCHEMA_CACHE set to off skips this step only.
+      # workflow together, and bump it. The path is the warm workflow's save path, the same
+      # string: actions/cache derives an entry's version from the path list, so another
+      # path never restores. POFIX_SCHEMA_CACHE set to off skips this step only.
       - name: Restore the schema page cache
         if: vars.POFIX_SCHEMA_CACHE != 'off'
         continue-on-error: true
         timeout-minutes: 2
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/pofix-schema-restore
+          path: ${{ runner.temp }}/pofix-schema-stored
           key: pofix-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: pofix-schema-pages-v1-
 
@@ -1469,7 +1471,7 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          src="$RUNNER_TEMP/pofix-schema-restore"
+          src="$RUNNER_TEMP/pofix-schema-stored"
           dst="$RUNNER_TEMP/pofix-schema-upload"
           mkdir -p "$dst"
           if [ -d "$src" ] && [ ! -L "$src" ]; then

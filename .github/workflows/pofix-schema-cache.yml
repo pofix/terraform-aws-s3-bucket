@@ -69,7 +69,7 @@ jobs:
         run: |
           set -uo pipefail
           set -f
-          save="$RUNNER_TEMP/pofix-schema-save"
+          save="$RUNNER_TEMP/pofix-schema-stored"
           work="$RUNNER_TEMP/pofix-schema-work"
           mkdir "$save" "$work" || exit 1
           reg() { curl -fsS -g --proto '=https' --max-time 30 --max-filesize 50000000 "https://registry.terraform.io/$1"; }
@@ -127,10 +127,12 @@ jobs:
           echo "pages=$pages" >> "$GITHUB_OUTPUT"
 
       # A new key every run; the review restores the newest by the prefix. The prefix and
-      # its format version are the ones pr-review.yml.template restores.
+      # its format version are the ones pr-review.yml.template restores, and so is the
+      # path: actions/cache derives an entry's version from the path list, so a restore
+      # with another path never matches.
       - name: Save the schema page cache
         if: steps.pages.outputs.pages != '' && steps.pages.outputs.pages != '0'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/pofix-schema-save
+          path: ${{ runner.temp }}/pofix-schema-stored
           key: pofix-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}
