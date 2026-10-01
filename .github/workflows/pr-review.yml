@@ -376,7 +376,8 @@ jobs:
               name="${name#pofix / }"
               case "$name" in
                 # The names before the charged user was added to them: a run from before
-                # this workflow version is not counted.
+                # this workflow version is not counted. Residual: a job that ran under
+                # such a bare name in a current run is not counted either.
                 triage|review) ;;
                 triage*|review*)
                   [[ "$name" =~ ^(triage|review)\ \(user\ ([1-9][0-9]*)\)$ ]] || fail "a triage or review job name is not in the expected form; the runs cannot be counted, nothing runs"
@@ -386,16 +387,17 @@ jobs:
           }
           # A run name in neither of the caller's forms, such as a run from before the caller
           # set one, is not trusted to say whom it charged: its jobs are read, and it counts
-          # toward the job read cap, like a label run.
+          # toward the job read cap, like a label run. So is a run whose name does not match
+          # its event, a comment run named as a label run or a label run named as a comment
+          # run, which only an edited caller produces: only another user's comment run
+          # named as one is skipped.
           comment_title_re='^pofix review \(comment, user [1-9][0-9]*\)$'
           used=0
           today_runs=0
           while IFS=$'\t' read -r id created title hrepo hbranch; do
             [[ "$id" =~ ^[1-9][0-9]*$ ]] || fail "unexpected run id"
             [ "$id" != "$RUN_ID" ] || continue
-            if [ "$title" != "pofix review (comment, user $CHARGED_USER_ID)" ]; then
-              if [[ "$title" =~ $comment_title_re ]] || [ "$title" = "pofix review (label)" ]; then continue; fi
-            fi
+            if [ "$title" != "pofix review (comment, user $CHARGED_USER_ID)" ] && [[ "$title" =~ $comment_title_re ]]; then continue; fi
             jobs_read=$((jobs_read + 1))
             [ "$jobs_read" -le "$MAX_JOB_READS" ] || fail "more than $MAX_JOB_READS runs to read, too many to count; nothing runs"
             charged "$id"
@@ -404,7 +406,6 @@ jobs:
           while IFS=$'\t' read -r id created title hrepo hbranch; do
             [[ "$id" =~ ^[1-9][0-9]*$ ]] || fail "unexpected run id"
             [ "$id" != "$RUN_ID" ] || continue
-            if [[ "$title" =~ $comment_title_re ]]; then continue; fi
             jobs_read=$((jobs_read + 1))
             [ "$jobs_read" -le "$MAX_JOB_READS" ] || fail "more than $MAX_JOB_READS runs to read, too many to count; nothing runs"
             charged "$id"
@@ -896,7 +897,7 @@ jobs:
                 *) text="Stopped. The pofix-review label could not be removed; see the workflow run." ;;
               esac
               if [ "$STOP_RESULT" = success ] && [[ "$CANCELLED" =~ ^[0-9]+$ ]]; then
-                text="$text Cancelled $CANCELLED label runs in progress."
+                text="$text Label runs cancelled: $CANCELLED."
               else
                 text="$text Label runs could not be cancelled; see the workflow run."
               fi ;;
@@ -936,9 +937,12 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
-    # One feedback job at a time per feedback repository, so two entries on one rule ID
-    # cannot both find no issue and open two. The key is the repository the issue step
-    # checks as owner/name; a running job is never cancelled.
+    # One feedback job at a time per module repository and feedback repository, so two
+    # entries on one rule ID from one module repository cannot both find no issue and open
+    # two. A concurrency group holds within the repository that runs the workflow. [verify]
+    # Residual: two module repositories filing to one feedback repository are in separate
+    # groups, and their jobs can race. The key is the repository the issue step checks as
+    # owner/name; a running job is never cancelled.
     concurrency:
       group: pofix-feedback-${{ inputs.feedback_repository }}
       cancel-in-progress: false
@@ -1253,18 +1257,32 @@ jobs:
           sudo rm -f /etc/sudoers.d/runner
           if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
 
-      # setup-terraform has no retry input and does not retry its release lookup. A first
-      # attempt that fails or runs past its 5 minute timeout gets one more after a pause,
-      # with the same action and version; a second failure fails the job, as one did before.
+      # Terraform from its release zip at a fixed URL, checked against a pinned SHA-256
+      # before it is extracted, the way the review job installs the Terraform MCP server.
+      # A first attempt that fails or runs past its 5 minute timeout gets one more after a
+      # pause, with the same URL and checksum; a second failure fails the job.
       - name: Install Terraform
         id: install-terraform
         if: steps.workspace.outputs.head_moved == 'false'
         continue-on-error: true
         timeout-minutes: 5
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        with:
-          terraform_version: 1.16.4
-          terraform_wrapper: false
+        env:
+          TERRAFORM_VERSION: 1.16.4
+          # From terraform_1.16.4_SHA256SUMS on releases.hashicorp.com, read 2026-10-01; the
+          # same value the plan runner's image pins.
+          TERRAFORM_SHA256: dc94af0eef1147718ad7c8daea792ed199e3e0492eec180d0adafa2a65a879df
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/terraform-bin"
+          rm -rf "$dir"
+          mkdir "$dir"
+          zip="$dir/terraform.zip"
+          curl -fsSL --proto '=https' --max-time 120 -o "$zip" "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "$TERRAFORM_SHA256  $zip" | sha256sum -c --quiet
+          unzip -q "$zip" terraform -d "$dir"
+          rm -f "$zip"
+          "$dir/terraform" version
+          echo "$dir" >> "$GITHUB_PATH"
 
       - name: Wait before the second Terraform install attempt
         if: steps.workspace.outputs.head_moved == 'false' && steps.install-terraform.outcome == 'failure'
@@ -1273,10 +1291,23 @@ jobs:
       - name: Install Terraform, second attempt
         if: steps.workspace.outputs.head_moved == 'false' && steps.install-terraform.outcome == 'failure'
         timeout-minutes: 5
-        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
-        with:
-          terraform_version: 1.16.4
-          terraform_wrapper: false
+        env:
+          TERRAFORM_VERSION: 1.16.4
+          # From terraform_1.16.4_SHA256SUMS on releases.hashicorp.com, read 2026-10-01; the
+          # same value the plan runner's image pins.
+          TERRAFORM_SHA256: dc94af0eef1147718ad7c8daea792ed199e3e0492eec180d0adafa2a65a879df
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/terraform-bin"
+          rm -rf "$dir"
+          mkdir "$dir"
+          zip="$dir/terraform.zip"
+          curl -fsSL --proto '=https' --max-time 120 -o "$zip" "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+          echo "$TERRAFORM_SHA256  $zip" | sha256sum -c --quiet
+          unzip -q "$zip" terraform -d "$dir"
+          rm -f "$zip"
+          "$dir/terraform" version
+          echo "$dir" >> "$GITHUB_PATH"
 
       # The pass runs in bubblewrap: the root file system read-only; the runner temp
       # directory, the runner's own install directories and the tool cache each replaced by
@@ -1622,6 +1653,8 @@ jobs:
           }
           fetch_skills "$RUNNER_TEMP/pofix-agent" "$SKILLS_REPOSITORY" "$SKILLS_SHA"
           fetch_skills "$RUNNER_TEMP/terraform-skill" antonbabenko/terraform-skill "$TERRAFORM_SKILLS_SHA"
+          # The host records stand in for the GitHub reads, so the model never loads them.
+          rm -- "$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/github-io.md"
           # The user skills directory holds one link per skill, so skills load from these
           # pinned copies only, never from the workspace.
           mkdir -p "$HOME/.claude/skills"
@@ -1677,14 +1710,12 @@ jobs:
           if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
 
       # This attempt's own jobs, read afresh just before the model runs and joined to the
-      # gate's pairs: the check runs the skill drops, by the pair of id and check suite. A
-      # job not listed yet has no check run on the head. Every read runs in a subshell; any
+      # gate's pairs: the check runs the host pass drops, by the pair of id and check suite.
+      # A job not listed yet has no check run on the head. Every read runs in a subshell; any
       # failure there, a job without a check run URL, a pair in another form, more than 300
-      # API requests or 1000 pairs gives the fixed line that the host's own check runs could
-      # not be read, which the skill reads as an unknown Checks signal: the job goes on, and
-      # the review is inconclusive rather than misled by its own jobs. The line goes into
-      # the prompt inside a host block whose markers carry a nonce drawn for this run, so
-      # the skill can tell it from the same text in the pull request or a file.
+      # API requests or 1000 pairs gives status=unreadable, which the host pass reads as an
+      # unknown Checks signal: the job goes on, and the review is inconclusive rather than
+      # misled by its own jobs. Otherwise status=ok and the pairs, checked in the subshell.
       - name: List the host's own check runs
         id: own-checks
         env:
@@ -1701,49 +1732,118 @@ jobs:
           collect() ( # -> "<requests> <pairs>"; exits non-zero on any fault
             set -euo pipefail
             requests=1 page=1 all="$GATE_PAIRS"
-            [[ -z "$all" || "$all" =~ $pairs_re ]]
-            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+            [[ -z "$all" || "$all" =~ $pairs_re ]] || exit 1
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 1
             suite="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" --jq '.check_suite_id')"
-            [[ "$suite" =~ ^[1-9][0-9]*$ ]]
+            [[ "$suite" =~ ^[1-9][0-9]*$ ]] || exit 1
             while :; do
               requests=$((requests + 1))
               [ "$requests" -le "$MAX_REQUESTS" ]
               jobs="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100&page=$page")"
               total="$(jq -r '.total_count' <<< "$jobs")"
-              [[ "$total" =~ ^[0-9]+$ ]]
+              [[ "$total" =~ ^[0-9]+$ ]] || exit 1
               urls="$(jq -r '.jobs[] | .check_run_url // "-"' <<< "$jobs")"
               while IFS= read -r url; do
                 [ -n "$url" ] || continue
-                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]]
+                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]] || exit 1
                 all="${all:+$all }${BASH_REMATCH[1]}:$suite"
               done <<< "$urls"
               [ $((page * 100)) -lt "$total" ] || break
               page=$((page + 1))
             done
             [ "$(wc -w <<< "$all")" -le "$MAX_PAIRS" ]
-            [[ "$all" =~ $pairs_re ]]
+            [[ "$all" =~ $pairs_re ]] || exit 1
             echo "$requests $all"
           )
           # Outside any condition, so set -e holds inside the subshell.
           set +e; out="$(collect)"; status=$?; set -e
           if [ "$status" = 0 ]; then
-            line="The host's own check runs: \`${out#* }\`."
             summary="own check runs: ${out%% *} API requests, $(wc -w <<< "${out#* }" | tr -d ' ') check run pairs"
+            { echo "status=ok"; echo "pairs=${out#* }"; } >> "$GITHUB_OUTPUT"
           else
-            line="The host's own check runs could not be read."
             summary="own check runs: could not be read; the review reads the Checks signal as unknown"
             echo "::warning::$summary"
+            echo "status=unreadable" >> "$GITHUB_OUTPUT"
           fi
-          nonce="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-          [[ "$nonce" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::no nonce for the host block"; exit 1; }
-          # The prompt input is echoed in the public job log; the mask keeps the nonce out of it.
-          echo "::add-mask::$nonce"
           echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo "start=<<<pofix-host-signals $nonce>>>"
-            echo "line=$line"
-            echo "end=<<<end-pofix-host-signals $nonce>>>"
-          } >> "$GITHUB_OUTPUT"
+
+      # The head's check runs and commit status, read by the pinned host pass before the
+      # model starts, so the model reads no check run itself (github-io.md, Check Runs). It
+      # drops the own job check runs above by exact pair, or reads the check runs as unknown
+      # when they could not be listed, and the own check named pofix review from this App's
+      # slug, always: an earlier run's completed check is this App's own verdict, whether or
+      # not check-start made one in this run. It keeps the latest run of each check, as stage
+      # 0 does, and writes checks.json, which holds no check name or status context, into
+      # a directory the sandbox cannot write. The script is checked again here. A refused
+      # input fails the job; a failed read stays in the file as an unknown signal. The reads
+      # work on a public repository with no permission, like stage 0's. [verify]
+      - name: Write the host's check runs file
+        id: host-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          OWN_STATUS: ${{ steps.own-checks.outputs.status }}
+          OWN_PAIRS: ${{ steps.own-checks.outputs.pairs }}
+          APP_SLUG: ${{ steps.read-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          hp="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/host-pass.sh"
+          out="$RUNNER_TEMP/pofix-host-checks"
+          own=(--own-unreadable)
+          [ "$OWN_STATUS" != ok ] || own=(--own-pairs "$OWN_PAIRS")
+          bash "$hp" checks --repo "$REPOSITORY" --head "$GATE_HEAD" --out "$out" "${own[@]}" \
+            --own-check "pofix review" --app "$APP_SLUG" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash "$hp" check "$out" --head "$GATE_HEAD"
+          echo "line=The host's check runs: \`$out\`." >> "$GITHUB_OUTPUT"
+
+      # The triage's model, from repository variables only: POFIX_BEDROCK_TRIAGE_MODEL when
+      # set, POFIX_BEDROCK_MODEL otherwise. Checked against the same pattern as the review
+      # job's lead and helper models, a [1m] suffix allowed: a full model name, a Bedrock
+      # inference profile id or an ARN. Anything else fails the job before the credentials.
+      - name: Set the triage model
+        id: triage-model
+        env:
+          TRIAGE_MODEL: ${{ vars.POFIX_BEDROCK_TRIAGE_MODEL || vars.POFIX_BEDROCK_MODEL }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          id_re='^claude-[a-z0-9-]+$|^([a-z]+\.)?anthropic\.[A-Za-z0-9._:-]+$|^arn:aws[a-z-]*:bedrock:[A-Za-z0-9._:/-]+$'
+          [[ "${TRIAGE_MODEL%"[1m]"}" =~ $id_re ]] || fail "POFIX_BEDROCK_TRIAGE_MODEL or POFIX_BEDROCK_MODEL is not a full model name, inference profile id or ARN"
+          echo "model=$TRIAGE_MODEL" >> "$GITHUB_OUTPUT"
+          echo "triage model $TRIAGE_MODEL"
+
+      # The pull request, read by the pinned host pass before the model starts, so the
+      # model makes none of these reads (host-pass.md): metadata, the changed files and
+      # the trees proofs, reviews, threads, conversation and bot comments under their
+      # bounds, and related issues, with the read-only App token. It writes host.json,
+      # task.md with every piece of prose in the untrusted block, and files.json into a
+      # directory the sandbox cannot write. The review job adds the verify job's checked
+      # results there; the skill checks them against its own clone. check binds the
+      # records to the gate's head, so a head that moved fails the job. A refused input
+      # or a failed read of the metadata, the head tree or the files fails the job.
+      - name: Write the host records
+        id: host-records
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          APP_SLUG: ${{ steps.read-token.outputs.app-slug }}
+          TRIAGE: 'true'
+        run: |
+          set -euo pipefail
+          hp="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/host-pass.sh"
+          out="$RUNNER_TEMP/pofix-host-records"
+          mode=()
+          [ "$TRIAGE" != true ] || mode=(--triage)
+          bash "$hp" run --repo "$REPOSITORY" --pr "$PR_NUMBER" --login "$APP_SLUG[bot]" --out "$out" --render-only ${mode[@]+"${mode[@]}"} |
+            tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-verify/verify.json" ]; then
+            cp -- "$RUNNER_TEMP/pofix-verify/verify.json" "$out/verify.json"
+          fi
+          bash "$hp" check "$out" --head "$GATE_HEAD"
+          echo "line=Host records: $out" >> "$GITHUB_OUTPUT"
 
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
@@ -1768,21 +1868,19 @@ jobs:
         with:
           use_bedrock: true
           github_token: ${{ steps.read-token.outputs.token }}
-          # The prompt is built from the gate outputs, the output directory and the App slug
-          # only. The mode line is this workflow's own fixed text, never copied from the pull
-          # request or a comment: it is what makes this run a triage. The last lines name the
-          # host's own check and, in the nonce-marked host block, the check runs of this
-          # workflow's own jobs, so the skill does not read them as signals about the change.
+          # The prompt is built from the gate outputs, the output directory and the host checks
+          # line only. The mode line is this workflow's own fixed text, never copied from the
+          # pull request or a comment: it is what makes this run a triage. The last line is the
+          # host checks step's, naming the check runs file with the host's own check and this
+          # workflow's own jobs dropped, so the skill does not read them as signals.
           prompt: |
             Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
             mode: triage
             The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
             This is a hosted run with no local conversation, so it is render-only. Do not post anything to GitHub.
             Output directory: ${{ runner.temp }}/pofix-out
-            ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
-            ${{ steps.own-checks.outputs.start }}
-            ${{ steps.own-checks.outputs.line }}
-            ${{ steps.own-checks.outputs.end }}
+            ${{ steps.host-checks.outputs.line }}
+            ${{ steps.host-records.outputs.line }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
           # docs, the same as the review job's. No Terraform host is allowed: this job runs
@@ -1846,9 +1944,9 @@ jobs:
           # .claude/ and .mcp.json from loading. [verify] No MCP server: a triage fetches no
           # provider page. No Edit, Write or web tool, and no sub-agent: Agent is denied.
           # POFIX_BEDROCK_TRIAGE_MODEL, when set, runs the triage on another model; the
-          # Bedrock role must allow that model too.
+          # Bedrock role must allow that model too. The value is the checked one.
           claude_args: >-
-            --model ${{ vars.POFIX_BEDROCK_TRIAGE_MODEL || vars.POFIX_BEDROCK_MODEL }}
+            --model ${{ steps.triage-model.outputs.model }}
             --max-turns 150
             --setting-sources user
             --strict-mcp-config
@@ -2052,6 +2150,8 @@ jobs:
           }
           fetch_skills "$RUNNER_TEMP/pofix-agent" "$SKILLS_REPOSITORY" "$SKILLS_SHA"
           fetch_skills "$RUNNER_TEMP/terraform-skill" antonbabenko/terraform-skill "$TERRAFORM_SKILLS_SHA"
+          # The host records stand in for the GitHub reads, so the model never loads them.
+          rm -- "$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/github-io.md"
           # The user skills directory holds one link per skill, so skills load from these
           # pinned copies only, never from the workspace.
           mkdir -p "$HOME/.claude/skills"
@@ -2286,14 +2386,12 @@ jobs:
           echo "lead model $LEAD_MODEL, W $window tokens, fetch helper model $helper"
 
       # This attempt's own jobs, read afresh just before the model runs and joined to the
-      # gate's pairs: the check runs the skill drops, by the pair of id and check suite. A
-      # job not listed yet has no check run on the head. Every read runs in a subshell; any
+      # gate's pairs: the check runs the host pass drops, by the pair of id and check suite.
+      # A job not listed yet has no check run on the head. Every read runs in a subshell; any
       # failure there, a job without a check run URL, a pair in another form, more than 300
-      # API requests or 1000 pairs gives the fixed line that the host's own check runs could
-      # not be read, which the skill reads as an unknown Checks signal: the job goes on, and
-      # the review is inconclusive rather than misled by its own jobs. The line goes into
-      # the prompt inside a host block whose markers carry a nonce drawn for this run, so
-      # the skill can tell it from the same text in the pull request or a file.
+      # API requests or 1000 pairs gives status=unreadable, which the host pass reads as an
+      # unknown Checks signal: the job goes on, and the review is inconclusive rather than
+      # misled by its own jobs. Otherwise status=ok and the pairs, checked in the subshell.
       - name: List the host's own check runs
         id: own-checks
         env:
@@ -2310,49 +2408,102 @@ jobs:
           collect() ( # -> "<requests> <pairs>"; exits non-zero on any fault
             set -euo pipefail
             requests=1 page=1 all="$GATE_PAIRS"
-            [[ -z "$all" || "$all" =~ $pairs_re ]]
-            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+            [[ -z "$all" || "$all" =~ $pairs_re ]] || exit 1
+            [[ "$RUN_ID" =~ ^[1-9][0-9]*$ && "$RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 1
             suite="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT" --jq '.check_suite_id')"
-            [[ "$suite" =~ ^[1-9][0-9]*$ ]]
+            [[ "$suite" =~ ^[1-9][0-9]*$ ]] || exit 1
             while :; do
               requests=$((requests + 1))
               [ "$requests" -le "$MAX_REQUESTS" ]
               jobs="$(gh api "repos/$REPOSITORY/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100&page=$page")"
               total="$(jq -r '.total_count' <<< "$jobs")"
-              [[ "$total" =~ ^[0-9]+$ ]]
+              [[ "$total" =~ ^[0-9]+$ ]] || exit 1
               urls="$(jq -r '.jobs[] | .check_run_url // "-"' <<< "$jobs")"
               while IFS= read -r url; do
                 [ -n "$url" ] || continue
-                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]]
+                [[ "$url" =~ /check-runs/([1-9][0-9]*)$ ]] || exit 1
                 all="${all:+$all }${BASH_REMATCH[1]}:$suite"
               done <<< "$urls"
               [ $((page * 100)) -lt "$total" ] || break
               page=$((page + 1))
             done
             [ "$(wc -w <<< "$all")" -le "$MAX_PAIRS" ]
-            [[ "$all" =~ $pairs_re ]]
+            [[ "$all" =~ $pairs_re ]] || exit 1
             echo "$requests $all"
           )
           # Outside any condition, so set -e holds inside the subshell.
           set +e; out="$(collect)"; status=$?; set -e
           if [ "$status" = 0 ]; then
-            line="The host's own check runs: \`${out#* }\`."
             summary="own check runs: ${out%% *} API requests, $(wc -w <<< "${out#* }" | tr -d ' ') check run pairs"
+            { echo "status=ok"; echo "pairs=${out#* }"; } >> "$GITHUB_OUTPUT"
           else
-            line="The host's own check runs could not be read."
             summary="own check runs: could not be read; the review reads the Checks signal as unknown"
             echo "::warning::$summary"
+            echo "status=unreadable" >> "$GITHUB_OUTPUT"
           fi
-          nonce="$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')"
-          [[ "$nonce" =~ ^[0-9a-f]{16}$ ]] || { echo "::error::no nonce for the host block"; exit 1; }
-          # The prompt input is echoed in the public job log; the mask keeps the nonce out of it.
-          echo "::add-mask::$nonce"
           echo "$summary"; echo "$summary" >> "$GITHUB_STEP_SUMMARY"
-          {
-            echo "start=<<<pofix-host-signals $nonce>>>"
-            echo "line=$line"
-            echo "end=<<<end-pofix-host-signals $nonce>>>"
-          } >> "$GITHUB_OUTPUT"
+
+      # The head's check runs and commit status, read by the pinned host pass before the
+      # model starts, so the model reads no check run itself (github-io.md, Check Runs). It
+      # drops the own job check runs above by exact pair, or reads the check runs as unknown
+      # when they could not be listed, and the own check named pofix review from this App's
+      # slug, always: an earlier run's completed check is this App's own verdict, whether or
+      # not check-start made one in this run. It keeps the latest run of each check, as stage
+      # 0 does, and writes checks.json, which holds no check name or status context, into
+      # a directory the sandbox cannot write. The script is checked again here. A refused
+      # input fails the job; a failed read stays in the file as an unknown signal. The reads
+      # work on a public repository with no permission, like stage 0's. [verify]
+      - name: Write the host's check runs file
+        id: host-checks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          OWN_STATUS: ${{ steps.own-checks.outputs.status }}
+          OWN_PAIRS: ${{ steps.own-checks.outputs.pairs }}
+          APP_SLUG: ${{ steps.read-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          hp="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/host-pass.sh"
+          out="$RUNNER_TEMP/pofix-host-checks"
+          own=(--own-unreadable)
+          [ "$OWN_STATUS" != ok ] || own=(--own-pairs "$OWN_PAIRS")
+          bash "$hp" checks --repo "$REPOSITORY" --head "$GATE_HEAD" --out "$out" "${own[@]}" \
+            --own-check "pofix review" --app "$APP_SLUG" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash "$hp" check "$out" --head "$GATE_HEAD"
+          echo "line=The host's check runs: \`$out\`." >> "$GITHUB_OUTPUT"
+
+      # The pull request, read by the pinned host pass before the model starts, so the
+      # model makes none of these reads (host-pass.md): metadata, the changed files and
+      # the trees proofs, reviews, threads, conversation and bot comments under their
+      # bounds, and related issues, with the read-only App token. It writes host.json,
+      # task.md with every piece of prose in the untrusted block, and files.json into a
+      # directory the sandbox cannot write. The review job adds the verify job's checked
+      # results there; the skill checks them against its own clone. check binds the
+      # records to the gate's head, so a head that moved fails the job. A refused input
+      # or a failed read of the metadata, the head tree or the files fails the job.
+      - name: Write the host records
+        id: host-records
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          APP_SLUG: ${{ steps.read-token.outputs.app-slug }}
+          TRIAGE: 'false'
+        run: |
+          set -euo pipefail
+          hp="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/host-pass.sh"
+          out="$RUNNER_TEMP/pofix-host-records"
+          mode=()
+          [ "$TRIAGE" != true ] || mode=(--triage)
+          bash "$hp" run --repo "$REPOSITORY" --pr "$PR_NUMBER" --login "$APP_SLUG[bot]" --out "$out" --render-only ${mode[@]+"${mode[@]}"} |
+            tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-verify/verify.json" ]; then
+            cp -- "$RUNNER_TEMP/pofix-verify/verify.json" "$out/verify.json"
+          fi
+          bash "$hp" check "$out" --head "$GATE_HEAD"
+          echo "line=Host records: $out" >> "$GITHUB_OUTPUT"
 
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
@@ -2377,27 +2528,24 @@ jobs:
         with:
           use_bedrock: true
           github_token: ${{ steps.read-token.outputs.token }}
-          # The prompt is built from the gate outputs, the output directory, the App slug and
-          # the versions line the fact sheets check wrote from a versions.json of the exact
-          # shape it checks, directory names and versions only. The last lines name the
-          # host's own check and, in the nonce-marked host block, the check runs of this
-          # workflow's own jobs, so the skill does not read them as signals about the change.
+          # The prompt is built from the gate outputs, the output directory, the host checks
+          # line and the versions line the fact sheets check wrote from a versions.json of the
+          # exact shape it checks, directory names and versions only. The last line is the
+          # host checks step's, naming the check runs file with the host's own check and this
+          # workflow's own jobs dropped, so the skill does not read them as signals.
           prompt: |
             Use the terraform-module-pr-review skill to review https://github.com/${{ needs.gate.outputs.repository }}/pull/${{ needs.gate.outputs.pr_number }}.
             The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
             This is a hosted run with no local conversation, so it is render-only. Do not post anything to GitHub.
             Output directory: ${{ runner.temp }}/pofix-out
-            ${{ needs.verify.result == 'success' && format('Verification results file: {0}/pofix-verify/verify.json', runner.temp) || 'Verification did not run: there is no verification results file. Record every example check as not run.' }}
             No AWS profile is named for this run, so the plan pass does not run.
             The context window W of the model this host runs for the lead, as the terraform-module-reviewer large-changes.md Size Threshold reads it: ${{ steps.models.outputs.context_window }} tokens.
             This host runs isolated fetches: hand every schema entry to the pofix-fetch-helper sub-agent, as the terraform-module-reviewer large-changes.md Budget says. Start no other sub-agent.
             Schema page cache, read-only: ${{ runner.temp }}/pofix-schema-cache. The file <namespace>/<name>/<version>/<resources or data-sources>/<type without the provider prefix>.md there, when it exists, is the registry documentation page for that entry; read it as the terraform-module-reviewer large-changes.md Budget says.
             Provider fact sheets, read-only: ${{ runner.temp }}/pofix-schema-facts, as the terraform-module-reviewer large-changes.md Budget describes: <namespace>/<name>/<version>/index.json there says for each type whether it is a sheet, absent or page, and a sheet is the file <resources or data-sources>/<type>.facts beside it.
             ${{ steps.facts-check.outputs.versions != '' && format('Provider versions per directory, from the host, as the Budget reads them: {0}', steps.facts-check.outputs.versions) || 'The host gives no provider versions: resolve them as the Budget says.' }}
-            ${{ needs.check-start.outputs.check_run_id != '' && format('The host''s own check: name `pofix review`, app `{0}`.', steps.read-token.outputs.app-slug) || '' }}
-            ${{ steps.own-checks.outputs.start }}
-            ${{ steps.own-checks.outputs.line }}
-            ${{ steps.own-checks.outputs.end }}
+            ${{ steps.host-checks.outputs.line }}
+            ${{ steps.host-records.outputs.line }}
           # Written to the user settings file, where sandbox credentials and the strict
           # allowlist are honored. Key names from the Claude Code sandboxing and permissions
           # docs. The Read deny rules apply to Read and, best effort, to Glob and Grep; the
