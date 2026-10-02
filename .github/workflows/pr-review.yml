@@ -25,6 +25,10 @@
 #            with an App token that can only write checks.
 #   verify - runs terraform init and validate on the head's examples, with no credential,
 #            and uploads the results as one JSON file.
+#   plan   - on `@pofix plan`, after verify: the credentialed plan pass in containers, with
+#            the CI role from OIDC in the pofix-plan environment and no secret, and uploads
+#            only its hosted record as one JSON file. Decision record:
+#            docs/isolated-runner.md, Option 3 revisited.
 #   schema - gathers the provider pages the gate's needs call for, from the mirror, the
 #            schema page cache and the registry, with no credential, and uploads the
 #            checked pages as one artifact.
@@ -32,7 +36,8 @@
 #            read-only App token, and uploads comment.md and result.json as an artifact.
 #   review - stage 2: runs the skill render-only as a full review, with a read-only App
 #            token, and uploads comment.md and result.json as an artifact. It runs when
-#            triage did not block, or at once when the comment asks for `@pofix full`.
+#            triage did not block, or at once when the comment asks for `@pofix full` or
+#            `@pofix plan`.
 #   post   - validates the artifact, re-reads the head, skips a duplicate, and posts one
 #            review with the event COMMENT, using a separate write token, then completes
 #            the check run with a conclusion mapped from the verdict. When stage 0 found
@@ -42,9 +47,10 @@
 # On an installation that has not granted the App the Checks permission, check-start fails
 # and shows red, the check jobs do nothing more, and the review is still posted.
 #
-# This file has no placeholder to fill. The action SHAs, the terraform-skill SHA, the
-# Terraform MCP server release checksum, the Terraform version and the apt versions are
-# pinned here; upgrade them by editing this file.
+# One placeholder, for the plan only: pofix/pofix-skills, the owner/name of the only
+# skills repository a plan runs from. Left in, the gate refuses every plan. The action SHAs,
+# the terraform-skill SHA, the Terraform MCP server release checksum, the Terraform version
+# and the apt versions are pinned here; upgrade them by editing this file.
 # Setup, prerequisites and how to pin or upgrade: ci/github/README.md
 #
 # Items marked [verify] are assumptions the live pilot must confirm.
@@ -124,8 +130,8 @@ env:
 
 jobs:
   gate:
-    # The comment body is read here and in the if: of the step that records a full review
-    # request, nowhere else. This if: runs before any runner starts.
+    # The comment body is read here and in the if: conditions of the steps that record a
+    # command, nowhere else. This if: runs before any runner starts.
     # Two ways in: a maintainer comment, or the pofix-review label. A label run starts when
     # the label is added, and on each push while the label is on the pull request. Who
     # added it is checked in the steps below, against the same allowlist and permission.
@@ -162,22 +168,29 @@ jobs:
       # The check runs of this workflow's own jobs on the head, as <check run id>:<suite id>
       # pairs separated by spaces, checked against that grammar; empty on a first run.
       own_pairs: ${{ steps.own-checks.outputs.pairs }}
-      # true only when the step below ran, which only its if: decides.
-      full_requested: ${{ steps.mode.outputs.full == 'true' }}
+      # true only when the step below ran, which only its if: decides, or on a plan, which
+      # implies the full review.
+      full_requested: ${{ steps.mode.outputs.full == 'true' || steps.verb-plan.outputs.verb == 'plan' }}
+      # requested, unconfigured or none: the plan job runs only on requested. The reason is
+      # one fixed word when unconfigured, empty otherwise.
+      plan_state: ${{ steps.plan-state.outputs.state || 'none' }}
+      plan_reason: ${{ steps.plan-state.outputs.reason }}
+      # POFIX_AWS_REGION, checked against the region pattern; set only when requested.
+      plan_region: ${{ steps.plan-state.outputs.region }}
       # The schema job's needs, each value checked against a strict pattern; empty when
       # the step that reads them failed.
       schema_providers: ${{ steps.needs.outputs.providers }}
       schema_types: ${{ steps.needs.outputs.types }}
-      # The command after the mention: stop, feedback, budget, full or review, in that order
-      # of precedence. Each is a fixed value written by a step whose if: alone decides it;
-      # anything else, and every label run, is review.
+      # The command after the mention: stop, feedback, budget, plan, full or review, in that
+      # order of precedence. Each is a fixed value written by a step whose if: alone decides
+      # it; anything else, and every label run, is review.
       # The run budget, from the count step: ok, monthly (the charged maintainer's monthly
       # limit is used) or daily (the pull request's label runs today are used). Digits only
       # for the counts.
       budget: ${{ steps.count.outputs.budget }}
       runs_left: ${{ steps.count.outputs.runs_left }}
       label_runs_today: ${{ steps.count.outputs.label_runs_today }}
-      verb: ${{ steps.verb-stop.outputs.verb || steps.verb-feedback.outputs.verb || steps.verb-budget.outputs.verb || (steps.mode.outputs.full == 'true' && 'full') || 'review' }}
+      verb: ${{ steps.verb-stop.outputs.verb || steps.verb-feedback.outputs.verb || steps.verb-budget.outputs.verb || steps.verb-plan.outputs.verb || (steps.mode.outputs.full == 'true' && 'full') || 'review' }}
     steps:
       # A label run: who added the label. On labeled, the event's sender. A push carries no
       # labeler, so on synchronize the last labeled or unlabeled event for the label, from
@@ -302,6 +315,16 @@ jobs:
         id: verb-budget
         if: github.event_name == 'issue_comment' && steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback' && contains(github.event.comment.body, '@pofix budget')
         run: echo "verb=budget" >> "$GITHUB_OUTPUT"
+
+      # A plan, the one command that issues credentials, counts only when the comment starts
+      # with it, as the whole comment or followed by a space, tab, line feed or carriage
+      # return, so a quote reply, a later mention or `@pofix planning` does not plan. The
+      # other commands use contains(). startsWith() and == ignore case, like contains();
+      # fromJSON gives the tab, line feed and carriage return.
+      - name: Record a plan command
+        id: verb-plan
+        if: github.event_name == 'issue_comment' && steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback' && steps.verb-budget.outputs.verb != 'budget' && (github.event.comment.body == '@pofix plan' || startsWith(github.event.comment.body, '@pofix plan ') || startsWith(github.event.comment.body, format('@pofix plan{0}', fromJSON('"\t"'))) || startsWith(github.event.comment.body, format('@pofix plan{0}', fromJSON('"\n"'))) || startsWith(github.event.comment.body, format('@pofix plan{0}', fromJSON('"\r"'))))
+        run: echo "verb=plan" >> "$GITHUB_OUTPUT"
 
       # The run budget. Runs are counted from this repository's history of the caller
       # workflow this month (UTC), with no other store. A run counts when its triage or full
@@ -609,11 +632,73 @@ jobs:
 
       # The full review request is read here, in this if: only. The step writes a fixed
       # value; nothing from the comment reaches a run step, an output or the prompt.
-      # contains() ignores case. A stop, feedback or budget command outranks it.
+      # contains() ignores case. A stop, feedback, budget or plan command outranks it; a plan
+      # implies the full review through the gate's full_requested output.
       - name: Record a full review request
         id: mode
-        if: github.event_name == 'issue_comment' && steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback' && steps.verb-budget.outputs.verb != 'budget' && contains(github.event.comment.body, '@pofix full')
+        if: github.event_name == 'issue_comment' && steps.verb-stop.outputs.verb != 'stop' && steps.verb-feedback.outputs.verb != 'feedback' && steps.verb-budget.outputs.verb != 'budget' && steps.verb-plan.outputs.verb != 'plan' && contains(github.event.comment.body, '@pofix full')
         run: echo "full=true" >> "$GITHUB_OUTPUT"
+
+      # Whether a plan may run, decided here, before any job that holds a credential: the
+      # state is requested only when every check below holds, and unconfigured with one
+      # fixed reason, the first check that failed, otherwise. Nothing here fails the gate:
+      # each read is bounded by a timeout and any failure of it is the reason read.
+      #   rerun               - a re-run attempt: a re-run pins the head again and anyone
+      #                         with write access can start one, so a plan needs a new request.
+      #   roles               - POFIX_PLAN_CI_ROLE_ARN or POFIX_PLAN_REVIEW_ROLE_ARN is not an
+      #                         IAM role ARN.
+      #   region              - POFIX_AWS_REGION is not a region name. Only the checked value
+      #                         reaches the plan job's credentials step and profile.
+      #   skills-repository   - skills_repository is not pofix/pofix-skills.
+      #   skills-commit       - skills_sha is not the head of that repository's default
+      #                         branch, read anonymously with git ls-remote.
+      #   environment         - pofix-plan is not limited to exactly one branch policy, of
+      #                         type branch, named the default branch.
+      #   read                - a read failed or timed out.
+      # The environment reads work on a public repository with the job token's metadata
+      # read. [verify]
+      - name: Check the plan configuration
+        id: plan-state
+        if: steps.verb-plan.outputs.verb == 'plan' && steps.stage0.outputs.stage0 == 'pass'
+        timeout-minutes: 3
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ steps.check.outputs.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          CI_ROLE_ARN: ${{ vars.POFIX_PLAN_CI_ROLE_ARN }}
+          REVIEW_ROLE_ARN: ${{ vars.POFIX_PLAN_REVIEW_ROLE_ARN }}
+          PLAN_REGION: ${{ vars.POFIX_AWS_REGION }}
+          SKILLS_REPOSITORY: ${{ steps.check.outputs.skills_repository }}
+          SKILLS_SHA: ${{ steps.check.outputs.skills_sha }}
+          PLAN_SKILLS_REPOSITORY: pofix/pofix-skills
+        run: |
+          set -uo pipefail
+          unconfigured() {
+            { echo "state=unconfigured"; echo "reason=$1"; } >> "$GITHUB_OUTPUT"
+            echo "plan: unconfigured: $1"
+            exit 0
+          }
+          arn_re='^arn:aws(-[a-z]+)*:iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]+$'
+          [ "$RUN_ATTEMPT" = 1 ] || unconfigured rerun
+          [[ "$CI_ROLE_ARN" =~ $arn_re ]] || unconfigured roles
+          [[ "$REVIEW_ROLE_ARN" =~ $arn_re ]] || unconfigured roles
+          [[ "$PLAN_REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || unconfigured region
+          [[ "$PLAN_SKILLS_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || unconfigured skills-repository
+          [ "$SKILLS_REPOSITORY" = "$PLAN_SKILLS_REPOSITORY" ] || unconfigured skills-repository
+          [[ "$DEFAULT_BRANCH" =~ ^[A-Za-z0-9._/-]{1,255}$ ]] || unconfigured read
+          tip="$(GIT_TERMINAL_PROMPT=0 timeout 30 git ls-remote "https://github.com/$SKILLS_REPOSITORY.git" HEAD)" || unconfigured read
+          tip="$(awk '$2 == "HEAD" { print $1 }' <<< "$tip")"
+          [[ "$tip" =~ ^[0-9a-f]{40}$ ]] || unconfigured read
+          [ "$tip" = "$SKILLS_SHA" ] || unconfigured skills-commit
+          env_json="$(timeout 30 gh api "repos/$REPOSITORY/environments/pofix-plan")" || unconfigured read
+          jq -e '.name == "pofix-plan" and .deployment_branch_policy.custom_branch_policies == true and .deployment_branch_policy.protected_branches == false' \
+            <<< "$env_json" > /dev/null 2>&1 || unconfigured environment
+          policies="$(timeout 30 gh api "repos/$REPOSITORY/environments/pofix-plan/deployment-branch-policies?per_page=100")" || unconfigured read
+          jq -e --arg branch "$DEFAULT_BRANCH" '.total_count == 1 and (.branch_policies | length == 1) and .branch_policies[0].type == "branch" and .branch_policies[0].name == $branch' \
+            <<< "$policies" > /dev/null 2>&1 || unconfigured environment
+          { echo "state=requested"; echo "region=$PLAN_REGION"; } >> "$GITHUB_OUTPUT"
+          echo "plan: requested"
 
       # The provider needs the schema job resolves, read from the .tf files of the pinned
       # head and of the pull request's base as text, through the API: nothing is checked
@@ -1084,7 +1169,7 @@ jobs:
   # model job runs. A label run keeps its label. Its token can write checks and nothing else.
   over-budget:
     needs: gate
-    if: needs.gate.result == 'success' && (needs.gate.outputs.verb == 'review' || needs.gate.outputs.verb == 'full') && (needs.gate.outputs.budget == 'monthly' || needs.gate.outputs.budget == 'daily')
+    if: needs.gate.result == 'success' && (needs.gate.outputs.verb == 'review' || needs.gate.outputs.verb == 'full' || needs.gate.outputs.verb == 'plan') && (needs.gate.outputs.budget == 'monthly' || needs.gate.outputs.budget == 'daily')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -1130,7 +1215,7 @@ jobs:
   # check-finish skip the check. The id is digits or the job fails.
   check-start:
     needs: gate
-    if: needs.gate.result == 'success' && (needs.gate.outputs.verb == 'review' || needs.gate.outputs.verb == 'full') && needs.gate.outputs.budget == 'ok'
+    if: needs.gate.result == 'success' && (needs.gate.outputs.verb == 'review' || needs.gate.outputs.verb == 'full' || needs.gate.outputs.verb == 'plan') && needs.gate.outputs.budget == 'ok'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions: {}
@@ -1393,6 +1478,289 @@ jobs:
         with:
           name: pofix-verify-${{ github.run_id }}
           path: ${{ runner.temp }}/verify-upload
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+  # The hosted, credentialed plan pass, on `@pofix plan` only (decision record:
+  # docs/isolated-runner.md, Option 3 revisited). The pinned skills' plan runner,
+  # run-pass.sh, runs terraform init and plan on the head's examples in containers on Docker
+  # internal networks behind per-phase proxies; containment is the boundary, and the head
+  # runs arbitrary code inside it. The job holds no secret and no write token: its one
+  # permission is id-token, its OIDC subject names the environment pofix-plan, which only
+  # the default branch may use, and the CI role that subject assumes may only assume the
+  # read-only review role, for one 900-second session per plan container. Before any
+  # credential: the workflow commit is its repository's default branch head, the head ref
+  # is still the gate's head, and the host's INPUT chains drop traffic from container
+  # bridges before passwordless sudo goes. Docker stays: the containers need it. The
+  # credentials reach one run step only, as a profile in a 0700 directory it removes, and
+  # every line run-pass.sh prints goes to a file. Only plan-hosted.json leaves the job; the
+  # review job checks it with host-pass.sh check like the verify results.
+  plan:
+    needs: [gate, verify]
+    if: needs.gate.outputs.plan_state == 'requested' && needs.verify.result == 'success' && needs.verify.outputs.head_moved == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 105
+    environment: pofix-plan
+    permissions:
+      id-token: write
+    concurrency:
+      group: pofix-plan-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}-${{ github.event_name }}
+      cancel-in-progress: false
+    outputs:
+      artifact_id: ${{ steps.upload-plan.outputs.artifact-id }}
+    steps:
+      - name: Download the pinned skills
+        env:
+          SKILLS_REPOSITORY: ${{ needs.gate.outputs.skills_repository }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/pofix-agent"
+          git init -q "$dest"
+          git -C "$dest" -c core.hooksPath=/dev/null fetch -q --depth 1 --no-tags "https://github.com/$SKILLS_REPOSITORY.git" "$SKILLS_SHA"
+          git -C "$dest" -c core.hooksPath=/dev/null -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$dest" rev-parse HEAD)" = "$SKILLS_SHA" ] || { echo "::error::$SKILLS_REPOSITORY is not at $SKILLS_SHA"; exit 1; }
+
+      # The subject the CI role trusts names this file by branch, which STS cannot tie to a
+      # commit, so the commit is checked here: a re-run of an old run would run old YAML.
+      # job.workflow_sha and job.workflow_repository name the file that defines this job,
+      # this reusable workflow, not the caller. The github context has no such property.
+      - name: Check the workflow commit
+        env:
+          JOB_WORKFLOW_SHA: ${{ job.workflow_sha }}
+          WORKFLOW_REPOSITORY: ${{ job.workflow_repository }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$JOB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "no workflow commit; no plan runs"
+          [[ "$WORKFLOW_REPOSITORY" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || fail "unexpected workflow repository; no plan runs"
+          tip="$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "https://github.com/$WORKFLOW_REPOSITORY.git" HEAD | awk '$2 == "HEAD" { print $1 }')"
+          [ "$tip" = "$JOB_WORKFLOW_SHA" ] || fail "this workflow is not the head of its repository's default branch; no plan runs"
+
+      # As in verify: the head as data, hooks and LFS filters off, with its origin remote so
+      # the plan runner can fetch the merge base for a re-run.
+      - name: Materialize the head
+        id: workspace
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          pr="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")"
+          [ "$(jq -r '.head.sha' <<< "$pr")" = "$GATE_HEAD" ] || fail "the head moved after the request; no plan runs"
+          base_ref="$(jq -r '.base.sha' <<< "$pr")"
+          [[ "$base_ref" =~ ^[0-9a-f]{40}$ ]] || fail "unexpected base commit"
+          merge_base="$(gh api "repos/$REPOSITORY/compare/$base_ref...$GATE_HEAD" --jq '.merge_base_commit.sha')"
+          [[ "$merge_base" =~ ^[0-9a-f]{40}$ ]] || fail "unexpected merge base"
+          root="$(cd "$RUNNER_TEMP" && pwd -P)"
+          run="$(mktemp -d "$root/pr-review.XXXXXX")"
+          clone="$run/clone"
+          git init -q --template= "$clone"
+          git -C "$clone" remote add origin "https://github.com/$REPOSITORY.git"
+          clone_git() {
+            GIT_LFS_SKIP_SMUDGE=1 git -C "$clone" -c core.hooksPath=/dev/null \
+              -c filter.lfs.smudge=cat -c filter.lfs.process= -c filter.lfs.required=false "$@"
+          }
+          if ! clone_git fetch -q --depth=1 --no-tags origin "$GATE_HEAD"; then
+            clone_git fetch -q --depth=1 --no-tags origin "refs/pull/$PR_NUMBER/head"
+          fi
+          [ "$(git -C "$clone" rev-parse FETCH_HEAD)" = "$GATE_HEAD" ] || fail "the fetched commit is not the requested one"
+          clone_git -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$clone" rev-parse HEAD)" = "$GATE_HEAD" ] || fail "the working copy is not at the requested commit"
+          gh api "repos/$REPOSITORY/pulls/$PR_NUMBER/files" --paginate --slurp | jq 'add' > "$run/files.json"
+          {
+            echo "run=$run"
+            echo "merge_base=$merge_base"
+          } >> "$GITHUB_OUTPUT"
+
+      # The examples the runner mode of plan-pass.md names: every example directory the
+      # change touches, or every one when the change touches a .tf file outside examples/,
+      # each a real directory under examples/ that holds a .tf file directly, in path order,
+      # each once. That is the set, or a subset of the set, host-pass.sh check accepts in
+      # plan-hosted.json, with the same name pattern; files.json is this job's own read of
+      # the changed files at the head the gate pinned. The module root is the repository
+      # root, as in verify, so a module root prefix the review's records name is not
+      # supported. [verify] Names come from find in a fixed form with NUL ends and from the
+      # changed files list, and each must match the plain name pattern; they reach
+      # run-pass.sh as array elements, relative to its --clone, never as shell text.
+      - name: List the examples to plan
+        env:
+          RUN: ${{ steps.workspace.outputs.run }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          name_re='^examples/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$'
+          cd "$RUN/clone"
+          declare -A have=() touched=()
+          if [ -d examples ] && [ ! -L examples ]; then
+            while IFS= read -r -d '' f; do
+              d="${f%/*}"
+              if [[ "$d" =~ $name_re ]] && [ -d "$d" ] && [ ! -L "$d" ]; then have["$d"]=1; fi
+            done < <(find examples -mindepth 2 -maxdepth 2 -type f -name '*.tf' -print0)
+          fi
+          all="$(jq -r '[.[] | .filename, (.previous_filename // empty)] | any(endswith(".tf") and (startswith("examples/") | not))' "$RUN/files.json")"
+          while IFS= read -r d; do
+            if [ -n "$d" ]; then touched["$d"]=1; fi
+          done < <(jq -r '.[] | .filename, (.previous_filename // empty) | capture("^(?<d>examples/[^/]+)(/|$)").d | select(test("^examples/[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$"))' "$RUN/files.json")
+          : > "$RUN/plan-examples"
+          n=0
+          while IFS= read -r d; do
+            [ -n "$d" ] || continue
+            if [ "$all" = true ] || [ -n "${touched[$d]+x}" ]; then
+              printf '%s\0' "$d" >> "$RUN/plan-examples"
+              n=$((n + 1))
+            fi
+          done < <(printf '%s\n' "${!have[@]}" | LC_ALL=C sort)
+          [ "$n" -gt 0 ] || fail "no example directory to plan"
+          echo "plan: $n example directories"
+
+      # Anonymously, as a fork author sees it: the pull request's head ref must still be
+      # the head the gate pinned, the one the clone holds.
+      - name: Check the head ref
+        env:
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          ref="$(GIT_TERMINAL_PROMPT=0 timeout 60 git ls-remote "https://github.com/$REPOSITORY.git" "refs/pull/$PR_NUMBER/head" |
+            awk -v ref="refs/pull/$PR_NUMBER/head" '$2 == ref { print $1 }')"
+          [ "$ref" = "$GATE_HEAD" ] || fail "the pull request head is not the head the gate pinned; no plan runs"
+
+      # From the pinned skills only, tagged as run-pass.sh expects; nothing from the head is
+      # in the build context.
+      - name: Build the plan runner images
+        run: |
+          set -euo pipefail
+          here="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/plan-runner"
+          tag="$(bash "$here/image-tag.sh")"
+          docker build -q -f "$here/Dockerfile.proxy" -t "plan-egress-proxy:$tag" "$here" > /dev/null
+          docker build -q -f "$here/Dockerfile.runner" -t "plan-runner:$tag" "$here" > /dev/null
+          echo "plan: images built"
+
+      # Containers reach the host itself through the bridges; drop that at INPUT for IPv4
+      # and IPv6, while sudo still works. Container traffic out goes through FORWARD and the
+      # runner's proxies, which these rules leave as they are.
+      - name: Drop container traffic to the host
+        run: |
+          set -euo pipefail
+          for t in iptables ip6tables; do
+            sudo "$t" -I INPUT -i br-+ -j DROP
+            sudo "$t" -I INPUT -i docker0 -j DROP
+          done
+
+      # The same lockdown as the other jobs, but Docker keeps running: the runner user
+      # reaches it through the docker group, never through sudo.
+      - name: Lock down the runner
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          # The hosted image grants passwordless sudo through this file. [verify]
+          sudo rm -f /etc/sudoers.d/runner
+          if sudo -n true 2> /dev/null; then fail "passwordless sudo still works"; fi
+
+      # The CI role, from this job's OIDC token, as step outputs only: no AWS_ variable is
+      # set for later steps. Its session lasts 5700 seconds, past the pass's 90 minutes. The
+      # region is the one the gate checked.
+      - name: Assume the plan CI role
+        id: aws
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.POFIX_PLAN_CI_ROLE_ARN }}
+          aws-region: ${{ needs.gate.outputs.plan_region }}
+          role-session-name: pofix-plan-ci-${{ github.run_id }}
+          role-duration-seconds: 5700
+          mask-aws-account-id: true
+          output-env-credentials: false
+          output-credentials: true
+
+      # The one step that holds the credentials. The OIDC request variables go first, so no
+      # process here can mint another token. The profile is a 0600 file pair in a 0700
+      # directory the trap removes, named to the AWS CLI in this step's environment only.
+      # run-pass.sh, from the pinned skills, gets fixed arguments and the checked examples;
+      # it runs its network check before the first session and fails closed, exit 2 with a
+      # fixed line on its standard error, which stays in a file. Its private
+      # directory, which holds the plan containers' credentials file, goes in a fresh empty
+      # 0700 directory of its own, apart from the clone, the lists and the logs. Everything it
+      # and hosted-record.sh print goes to files in the run directory; the log gets fixed
+      # lines only.
+      - name: Run the plan pass
+        timeout-minutes: 95
+        env:
+          PLAN_KEY_ID: ${{ steps.aws.outputs.aws-access-key-id }}
+          PLAN_KEY_SECRET: ${{ steps.aws.outputs.aws-secret-access-key }}
+          PLAN_KEY_SESSION: ${{ steps.aws.outputs.aws-session-token }}
+          PLAN_REGION: ${{ needs.gate.outputs.plan_region }}
+          REVIEW_ROLE_ARN: ${{ vars.POFIX_PLAN_REVIEW_ROLE_ARN }}
+          RUN: ${{ steps.workspace.outputs.run }}
+          MERGE_BASE: ${{ steps.workspace.outputs.merge_base }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          unset ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          [[ "$PLAN_REGION" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]] || fail "unexpected region"
+          profile="$(mktemp -d "$RUNNER_TEMP/plan-profile.XXXXXX")"
+          trap 'rm -rf -- "$profile"' EXIT
+          chmod 0700 "$profile"
+          (
+            umask 077
+            printf '[pofix-plan-ci]\naws_access_key_id = %s\naws_secret_access_key = %s\naws_session_token = %s\n' \
+              "$PLAN_KEY_ID" "$PLAN_KEY_SECRET" "$PLAN_KEY_SESSION" > "$profile/credentials"
+            printf '[profile pofix-plan-ci]\nregion = %s\n' "$PLAN_REGION" > "$profile/config"
+          )
+          chmod 0600 "$profile/credentials" "$profile/config"
+          unset PLAN_KEY_ID PLAN_KEY_SECRET PLAN_KEY_SESSION
+          export AWS_SHARED_CREDENTIALS_FILE="$profile/credentials" AWS_CONFIG_FILE="$profile/config"
+          examples=()
+          while IFS= read -r -d '' d; do examples+=("$d"); done < "$RUN/plan-examples"
+          [ "${#examples[@]}" -gt 0 ] || fail "no example directory to plan"
+          runner="$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/plan-runner"
+          mkdir -m 0700 "$RUN/runner-tmp"
+          rc=0
+          bash "$runner/run-pass.sh" --clone "$RUN/clone" --record "$RUN/plan-record" --profile pofix-plan-ci \
+            --role-arn "$REVIEW_ROLE_ARN" --base "$MERGE_BASE" --budget-minutes 90 --tmp "$RUN/runner-tmp" \
+            -- "${examples[@]}" > "$RUN/run-pass.out" 2> "$RUN/run-pass.err" || rc=$?
+          # Any status but 0, a refused network check included, fails the job with this line,
+          # and no later step runs, so nothing is uploaded.
+          [ "$rc" = 0 ] || fail "the plan pass did not finish; its output stays on the runner"
+          echo "plan: the plan pass finished"
+          # A fresh directory, so --out does not exist yet, as hosted-record.sh requires. Exit 1
+          # is a refused record and 2 a refused input; either fails the job before the upload.
+          mkdir "$RUNNER_TEMP/plan-out"
+          rc=0
+          bash "$runner/hosted-record.sh" --record "$RUN/plan-record" --head "$GATE_HEAD" --merge-base "$MERGE_BASE" \
+            --out "$RUNNER_TEMP/plan-out/plan-hosted.json" > "$RUN/hosted-record.out" 2>&1 || rc=$?
+          [ "$rc" = 0 ] || fail "the hosted plan record could not be written"
+          echo "plan: the hosted record is written"
+
+      # Only plan-hosted.json leaves the job, as a regular file with one link, a JSON object
+      # of at most 1 MiB, copied into a fresh directory.
+      - name: Check and stage the plan record
+        env:
+          OUT: ${{ runner.temp }}/plan-out
+          STAGE: ${{ runner.temp }}/plan-upload
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n")" = "plan-hosted.json" ] || fail "the plan output is not one regular file"
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "plan-hosted.json" ] || fail "the plan output holds more than plan-hosted.json"
+          [ "$(wc -c < "$OUT/plan-hosted.json")" -le 1048576 ] || fail "plan-hosted.json is over 1 MiB"
+          jq -e 'type == "object"' "$OUT/plan-hosted.json" > /dev/null || fail "plan-hosted.json is not a JSON object"
+          mkdir "$STAGE"
+          cp -- "$OUT/plan-hosted.json" "$STAGE/"
+
+      - name: Upload the plan record
+        id: upload-plan
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pofix-plan-${{ github.run_id }}
+          path: ${{ runner.temp }}/plan-upload
           if-no-files-found: error
           retention-days: 1
           overwrite: true
@@ -1834,7 +2202,8 @@ jobs:
       # bounds, and related issues, with the read-only App token. It writes host.json,
       # task.md with every piece of prose in the untrusted block, and files.json into a
       # directory the sandbox cannot write. The review job adds the verify job's checked
-      # results there; the skill checks them against its own clone. check binds the
+      # results there, and the plan job's record when check-plan accepts it; the skill
+      # checks them against its own clone. check binds the
       # records to the gate's head, so a head that moved fails the job. A refused input
       # or a failed read of the metadata, the head tree or the files fails the job.
       - name: Write the host records
@@ -1856,6 +2225,35 @@ jobs:
             tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-verify/verify.json" ]; then
             cp -- "$RUNNER_TEMP/pofix-verify/verify.json" "$out/verify.json"
+          fi
+          # The plan record, checked on its own against these records first (host-pass.md,
+          # Plan Record), so a record that no longer fits, as after the base moved during the
+          # plan, drops only the plan. Exit 0 copies it in; exit 1 drops it and maps the reason
+          # by a fixed case, any other line to other; any other status is a bug and fails.
+          if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-plan/plan-hosted.json" ]; then
+            rc=0
+            answer="$(bash "$hp" check-plan "$RUNNER_TEMP/pofix-plan/plan-hosted.json" "$out" --head "$GATE_HEAD")" || rc=$?
+            case "$rc" in
+              0)
+                [ "$answer" = "plan accepted" ] || { echo "::error::check-plan exited 0 without accepting"; exit 1; }
+                cp -- "$RUNNER_TEMP/pofix-plan/plan-hosted.json" "$out/plan-hosted.json"
+                echo "plan_record=accepted" >> "$GITHUB_OUTPUT" ;;
+              1)
+                case "$answer" in
+                  "plan rejected: plan record content") reason=content ;;
+                  "plan rejected: plan record prefix") reason=prefix ;;
+                  "plan rejected: plan record head") reason=head ;;
+                  "plan rejected: plan record merge base") reason=merge-base ;;
+                  "plan rejected: plan record examples") reason=examples ;;
+                  "plan rejected: records not a directory" | "plan rejected: records not a regular file" | \
+                    "plan rejected: records over the size cap" | "plan rejected: records files list" | \
+                    "plan rejected: records content") reason=records ;;
+                  *) reason=other ;;
+                esac
+                echo "plan record refused: $reason" | tee -a "$GITHUB_STEP_SUMMARY"
+                { echo "plan_record=refused"; echo "plan_record_reason=$reason"; } >> "$GITHUB_OUTPUT" ;;
+              *) echo "::error::host-pass.sh check-plan ended with status $rc"; exit 1 ;;
+            esac
           fi
           bash "$hp" check "$out" --head "$GATE_HEAD"
           echo "line=Host records: $out" >> "$GITHUB_OUTPUT"
@@ -2095,10 +2493,17 @@ jobs:
   # pull request alone. A failed or cancelled triage stops the run, with nothing posted.
   # The review starts after the later of verify and triage. The 25-minute triage timeout keeps
   # that within verify's 30-minute worst case; typically the delay is the triage time beyond verify's.
+  # On a plan, the review also waits for the plan job, up to its 105 minutes. plan is needed
+  # for its result and its artifact id only: the if: below has a status function, so a plan
+  # job that was skipped, failed or was cancelled does not skip the review, and the prompt
+  # then says which with a fixed line. !cancelled() rather than always(), so a run that was
+  # cancelled does not start the review. A stop does not cancel a plan run: stop cancels
+  # only label runs, and a plan is a comment run. A maintainer cancels a running plan by
+  # hand in the Actions UI; the revoke-sessions deny on the AWS roles cuts live sessions.
   review:
     # The charged user in the name, read back by the next runs' gates to count this run.
     name: review (user ${{ needs.gate.outputs.charged_user_id }})
-    needs: [gate, check-start, verify, schema, triage]
+    needs: [gate, check-start, verify, schema, triage, plan]
     if: ${{ !cancelled() && needs.gate.result == 'success' && needs.gate.outputs.stage0 == 'pass' && needs.verify.result != 'cancelled' && needs.verify.outputs.head_moved != 'true' && (needs.gate.outputs.full_requested == 'true' || (needs.triage.result == 'success' && needs.triage.outputs.stage2 == 'true')) }}
     outputs:
       artifact_id: ${{ steps.upload-review.outputs.artifact-id }}
@@ -2362,6 +2767,29 @@ jobs:
           [ "$(find "$VERIFY" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n")" = "verify.json" ] || fail "the verification results are not one regular file"
           [ "$(find "$VERIFY" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "verify.json" ] || fail "the verification results hold more than verify.json"
 
+      # The plan job's record, untrusted like the verify results: by the artifact id its
+      # upload returned, only on a plan that was requested and succeeded, and one regular
+      # file with one link. The skill accepts it only after host-pass.sh check binds it to
+      # this run, with the other host records.
+      - name: Download the plan record
+        if: needs.gate.outputs.plan_state == 'requested' && needs.plan.result == 'success'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.plan.outputs.artifact_id }}
+          merge-multiple: true
+          digest-mismatch: error
+          path: ${{ runner.temp }}/pofix-plan
+
+      - name: Check the plan record
+        if: needs.gate.outputs.plan_state == 'requested' && needs.plan.result == 'success'
+        env:
+          PLAN: ${{ runner.temp }}/pofix-plan
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [ "$(find "$PLAN" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n")" = "plan-hosted.json" ] || fail "the plan record is not one regular file"
+          [ "$(find "$PLAN" -mindepth 1 -maxdepth 1 -printf "%f\n")" = "plan-hosted.json" ] || fail "the plan record holds more than plan-hosted.json"
+
       # No Terraform in this job: terraform init runs providers the head chooses, and this
       # job holds credentials. The verify job runs init and validate without credentials.
       # Then Docker and passwordless sudo go, so sandboxed Bash can reach neither.
@@ -2505,7 +2933,8 @@ jobs:
       # bounds, and related issues, with the read-only App token. It writes host.json,
       # task.md with every piece of prose in the untrusted block, and files.json into a
       # directory the sandbox cannot write. The review job adds the verify job's checked
-      # results there; the skill checks them against its own clone. check binds the
+      # results there, and the plan job's record when check-plan accepts it; the skill
+      # checks them against its own clone. check binds the
       # records to the gate's head, so a head that moved fails the job. A refused input
       # or a failed read of the metadata, the head tree or the files fails the job.
       - name: Write the host records
@@ -2527,6 +2956,35 @@ jobs:
             tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-verify/verify.json" ]; then
             cp -- "$RUNNER_TEMP/pofix-verify/verify.json" "$out/verify.json"
+          fi
+          # The plan record, checked on its own against these records first (host-pass.md,
+          # Plan Record), so a record that no longer fits, as after the base moved during the
+          # plan, drops only the plan. Exit 0 copies it in; exit 1 drops it and maps the reason
+          # by a fixed case, any other line to other; any other status is a bug and fails.
+          if [ "$TRIAGE" != true ] && [ -f "$RUNNER_TEMP/pofix-plan/plan-hosted.json" ]; then
+            rc=0
+            answer="$(bash "$hp" check-plan "$RUNNER_TEMP/pofix-plan/plan-hosted.json" "$out" --head "$GATE_HEAD")" || rc=$?
+            case "$rc" in
+              0)
+                [ "$answer" = "plan accepted" ] || { echo "::error::check-plan exited 0 without accepting"; exit 1; }
+                cp -- "$RUNNER_TEMP/pofix-plan/plan-hosted.json" "$out/plan-hosted.json"
+                echo "plan_record=accepted" >> "$GITHUB_OUTPUT" ;;
+              1)
+                case "$answer" in
+                  "plan rejected: plan record content") reason=content ;;
+                  "plan rejected: plan record prefix") reason=prefix ;;
+                  "plan rejected: plan record head") reason=head ;;
+                  "plan rejected: plan record merge base") reason=merge-base ;;
+                  "plan rejected: plan record examples") reason=examples ;;
+                  "plan rejected: records not a directory" | "plan rejected: records not a regular file" | \
+                    "plan rejected: records over the size cap" | "plan rejected: records files list" | \
+                    "plan rejected: records content") reason=records ;;
+                  *) reason=other ;;
+                esac
+                echo "plan record refused: $reason" | tee -a "$GITHUB_STEP_SUMMARY"
+                { echo "plan_record=refused"; echo "plan_record_reason=$reason"; } >> "$GITHUB_OUTPUT" ;;
+              *) echo "::error::host-pass.sh check-plan ended with status $rc"; exit 1 ;;
+            esac
           fi
           bash "$hp" check "$out" --head "$GATE_HEAD"
           echo "line=Host records: $out" >> "$GITHUB_OUTPUT"
@@ -2583,6 +3041,66 @@ jobs:
           jq -r '"mode=\(.mode)", "depth=\(.depth)", "last_full=\(.last_full)"' "$out/meta.json" >> "$GITHUB_OUTPUT"
           { echo "base_ref=$base_ref"; echo "merge_base=$mb"; echo "facts=$facts"; } >> "$GITHUB_OUTPUT"
 
+      # The plan line of the prompt, one fixed line per case, from the gate's plan state and
+      # reason, the plan job's result and the host records step's check-plan outcome, each
+      # checked against its fixed set: no plan asked for, a plan not configured for this run
+      # and why, a plan job that did not succeed, a plan record the host refused and why, or
+      # the plan record in the host records. Anything else fails the job.
+      - name: Write the plan line
+        id: plan-line
+        env:
+          PLAN_STATE: ${{ needs.gate.outputs.plan_state }}
+          PLAN_REASON: ${{ needs.gate.outputs.plan_reason }}
+          PLAN_RESULT: ${{ needs.plan.result }}
+          PLAN_RECORD: ${{ steps.host-records.outputs.plan_record }}
+          PLAN_RECORD_REASON: ${{ steps.host-records.outputs.plan_record_reason }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          case "$PLAN_STATE" in
+            none) line="No plan was asked for, so the plan pass does not run." ;;
+            unconfigured)
+              case "$PLAN_REASON" in
+                rerun) why="a plan does not run on a re-run attempt" ;;
+                roles) why="the plan role variables are not IAM role ARNs" ;;
+                region) why="the AWS region variable is not a region name" ;;
+                skills-repository) why="the skills do not come from the plan skills repository" ;;
+                skills-commit) why="the skills commit is not the head of its default branch" ;;
+                environment) why="the pofix-plan environment is not limited to the default branch" ;;
+                read) why="a configuration read failed" ;;
+                *) fail "unexpected plan reason" ;;
+              esac
+              line="A plan was asked for, but the hosted plan pass is not configured for this run: $why. The plan pass does not run." ;;
+            requested)
+              case "$PLAN_RESULT" in
+                success)
+                  case "$PLAN_RECORD" in
+                    accepted)
+                      [ -f "$RUNNER_TEMP/pofix-host-records/plan-hosted.json" ] || fail "the plan record is not in the host records"
+                      line="The host ran the plan pass: its record is plan-hosted.json in the host records." ;;
+                    refused)
+                      case "$PLAN_RECORD_REASON" in
+                        content) why="it is not in the plan record form" ;;
+                        prefix) why="the module root is not the repository root" ;;
+                        head) why="it names another head commit" ;;
+                        merge-base) why="its merge base is not the one this review read, as after the base branch moved" ;;
+                        examples) why="its examples do not match this change, as after the base branch moved" ;;
+                        records) why="the host records did not pass the plan check" ;;
+                        other) why="for a reason the host does not name" ;;
+                        *) fail "unexpected plan record reason" ;;
+                      esac
+                      line="A plan was asked for and the hosted plan job finished, but the host refused its record: $why. This run has no plan record." ;;
+                    *) fail "unexpected plan record state" ;;
+                  esac ;;
+                failure | cancelled | skipped)
+                  line="A plan was asked for, but the hosted plan job ended $PLAN_RESULT, so this run has no plan record." ;;
+                *) fail "unexpected plan job result" ;;
+              esac ;;
+            *) fail "unexpected plan state" ;;
+          esac
+          echo "$line"
+          echo "line=$line" >> "$GITHUB_OUTPUT"
+
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
       # sandbox.credentials unsets them for sandboxed Bash only; the Read deny rules and
@@ -2606,9 +3124,10 @@ jobs:
         with:
           use_bedrock: true
           github_token: ${{ steps.read-token.outputs.token }}
-          # The prompt is built from the gate outputs, the output directory, the host checks
-          # line and the versions line the fact sheets check wrote from a versions.json of the
-          # exact shape it checks, directory names and versions only. The last line is the
+          # The prompt is built from the gate outputs, the output directory, the plan line's
+          # fixed text, the host checks line and the versions line the fact sheets check
+          # wrote from a versions.json of the exact shape it checks, directory names and
+          # versions only. The last line is the
           # host checks step's, naming the check runs file with the host's own check and this
           # workflow's own jobs dropped, so the skill does not read them as signals.
           prompt: |
@@ -2616,7 +3135,7 @@ jobs:
             The head commit when the review was requested is ${{ needs.gate.outputs.head_sha }}.
             This is a hosted run with no local conversation, so it is render-only. Do not post anything to GitHub.
             Output directory: ${{ runner.temp }}/pofix-out
-            No AWS profile is named for this run, so the plan pass does not run.
+            ${{ steps.plan-line.outputs.line }}
             The context window W of the model this host runs for the lead, as the terraform-module-reviewer large-changes.md Size Threshold reads it: ${{ steps.models.outputs.context_window }} tokens.
             This host runs isolated fetches: hand every schema entry to the pofix-fetch-helper sub-agent, as the terraform-module-reviewer large-changes.md Budget says. Start no other sub-agent.
             Schema page cache, read-only: ${{ runner.temp }}/pofix-schema-cache. The file <namespace>/<name>/<version>/<resources or data-sources>/<type without the provider prefix>.md there, when it exists, is the registry documentation page for that entry; read it as the terraform-module-reviewer large-changes.md Budget says.

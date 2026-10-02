@@ -3,18 +3,22 @@
 # A template to copy, not a live workflow. Copy it into each module repository as
 # .github/workflows/pofix-review.yml, then replace the placeholders:
 #   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
-#   master        the 40-hex commit of that repository to run pr-review.yml from
+#   master        the default branch of that repository, for example master:
+#                           pr-review.yml runs from the tip of that branch
 #   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
-#   5b5726a4808fc66c8b585ffcf5cb0e87d466acbd          the 40-hex commit of the skills to run
+#   c17ef22fa8135af2f06f87e83f8138912d7d5239          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
-# which explains how to pin and upgrade both SHAs. One of them is the organization
-# variable POFIX_MAINTAINERS, the maintainer allowlist: only a user it lists starts a run.
+# which explains the workflow ref, the skills SHA and how to upgrade each. One of them
+# is the organization variable POFIX_MAINTAINERS, the maintainer allowlist: only a user
+# it lists starts a run.
 #
 # GitHub reads this file from the default branch for issue_comment and pull_request_target
 # events, so a pull request cannot change it. A comment containing "@pofix" on a pull
 # request starts a run; the reusable workflow checks who wrote it before anything else
 # happens. A comment containing "@pofix full" asks for the full review at once, without the
-# triage first. The pofix-review label starts a run when it is added and on each push while
+# triage first. A comment that starts with `@pofix plan` asks for the full review with a
+# credentialed plan pass; the plan job's OIDC token comes from the id-token grant below.
+# The pofix-review label starts a run when it is added and on each push while
 # it is on the pull request; the reusable workflow checks who added it, and removes a label
 # a user it refuses added. pull_request_target runs with this repository's secrets even for
 # a fork, so no job here or in the reusable workflow checks out the head.
@@ -64,7 +68,7 @@ jobs:
     uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@master
     with:
       skills_repository: pofix/pofix-skills
-      skills_sha: 5b5726a4808fc66c8b585ffcf5cb0e87d466acbd
+      skills_sha: c17ef22fa8135af2f06f87e83f8138912d7d5239
       # The maintainer allowlist, passed explicitly so the value the gate checks is visible
       # here, in the caller, rather than read from the caller's context.
       maintainers: ${{ vars.POFIX_MAINTAINERS }}
