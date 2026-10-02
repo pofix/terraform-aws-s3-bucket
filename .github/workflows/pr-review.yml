@@ -100,7 +100,22 @@ env:
     and (.verdict | IN("hold for the next major", "block", "inconclusive",
       "changes suggested", "approve with nits", "approve"))
     and (.proposed_event | type == "string" and test("^[A-Z_]{1,20}$"))
+  # findings.json of the render contract: the rendered findings, the seven fields each.
+  FINDINGS_CONTRACT: >-
+    type == "array" and length <= 500
+    and all(.[]; type == "object"
+      and keys == ["file", "id", "line", "rule_id", "severity", "suggested_fix", "summary"]
+      and (.id | type == "string" and test("^F-[0-9]{3,4}$"))
+      and (.rule_id | type == "string" and test("^(compat|coverage|structure|examples|profile|scope|review)\\.[a-z0-9-]+$"))
+      and (.severity | IN("CRITICAL", "HIGH", "MEDIUM", "LOW"))
+      and (.file | type == "string" and length > 0 and length <= 1024)
+      and (.line == null or (.line | type == "number" and . >= 1 and . == floor))
+      and (.summary | type == "string" and length > 0 and length <= 2000)
+      and (.suggested_fix | type == "string" and length > 0 and length <= 4000))
   LEAK_PATTERN: 'ghs_|ghp_|gho_|ghu_|ghr_|github_pat_|AKIA[0-9A-Z]{12,}|ASIA[0-9A-Z]{12,}|eyJ[A-Za-z0-9_-]+\.eyJ|/home/runner'
+  # The verification setup an incremental review's record names: the verify job's
+  # terraform, so a change of it means a full review.
+  VERIFY_SETUP: terraform-1.16.4
   # One schema cache page, relative to the cache directory:
   # <namespace>/<name>/<version>/<resources|data-sources>/<type without the provider prefix>.md
   SCHEMA_PAGE_RE: '^[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9-]{0,63}/[0-9]{1,6}\.[0-9]{1,6}\.[0-9]{1,6}/(resources|data-sources)/[a-z0-9][a-z0-9_]{0,127}\.md$'
@@ -2008,19 +2023,21 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          expected="comment.md result.json "
-          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output is not exactly comment.md and result.json"
+          expected="comment.md findings.json result.json "
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output is not exactly comment.md, findings.json and result.json"
           [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output holds a link or a special file"
           [ -s "$OUT/comment.md" ] || fail "comment.md is empty"
           jq -e --arg target "$REPOSITORY#$PR_NUMBER" --argjson number "$PR_NUMBER" "$RESULT_CONTRACT" "$OUT/result.json" > /dev/null || fail "result.json does not match the contract"
-          if grep -qE -- "$LEAK_PATTERN" "$OUT/comment.md" "$OUT/result.json"; then fail "the review output matches a leak pattern"; fi
+          [ "$(wc -c < "$OUT/findings.json")" -le 1048576 ] || fail "findings.json is over 1 MiB"
+          jq -e "$FINDINGS_CONTRACT" "$OUT/findings.json" > /dev/null || fail "findings.json does not match the contract"
+          if grep -qE -- "$LEAK_PATTERN" "$OUT/comment.md" "$OUT/findings.json" "$OUT/result.json"; then fail "the review output matches a leak pattern"; fi
           if grep -qF -- "pofix-review:" "$OUT/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
           [ "$(wc -c < "$OUT/comment.md")" -le 65000 ] || fail "comment.md is too large to post"
           mkdir "$STAGE"
-          cp -- "$OUT/comment.md" "$OUT/result.json" "$STAGE/"
+          cp -- "$OUT/comment.md" "$OUT/findings.json" "$OUT/result.json" "$STAGE/"
           # Again on the staged copies, in case a file changed between the check and the cp.
-          [ "$(find "$STAGE" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the staged output is not two regular files"
-          if grep -qE -- "$LEAK_PATTERN" "$STAGE/comment.md" "$STAGE/result.json"; then fail "the staged output matches a leak pattern"; fi
+          [ "$(find "$STAGE" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the staged output is not three regular files"
+          if grep -qE -- "$LEAK_PATTERN" "$STAGE/comment.md" "$STAGE/findings.json" "$STAGE/result.json"; then fail "the staged output matches a leak pattern"; fi
           if grep -qF -- "pofix-review:" "$STAGE/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
           # The literal values, and their plain base64, of the secrets this job holds. The
           # values are masked in the log already and are never printed here. A secret
@@ -2030,7 +2047,7 @@ jobs:
             value="${!name:-}"
             [ -n "$value" ] || continue
             encoded="$(printf '%s' "$value" | base64 -w0)"
-            if grep -qF -e "$value" -e "$encoded" "$STAGE/comment.md" "$STAGE/result.json"; then
+            if grep -qF -e "$value" -e "$encoded" "$STAGE/comment.md" "$STAGE/findings.json" "$STAGE/result.json"; then
               fail "the staged output contains the value of $name"
             fi
           done
@@ -2086,6 +2103,15 @@ jobs:
     outputs:
       artifact_id: ${{ steps.upload-review.outputs.artifact-id }}
       artifact_digest: ${{ steps.upload-review.outputs.artifact-digest }}
+      # For the record post writes; each checked against its pattern where it is set.
+      mode: ${{ steps.prior.outputs.mode }}
+      depth: ${{ steps.prior.outputs.depth }}
+      last_full: ${{ steps.prior.outputs.last_full }}
+      base_ref: ${{ steps.prior.outputs.base_ref }}
+      merge_base: ${{ steps.prior.outputs.merge_base }}
+      facts: ${{ steps.prior.outputs.facts }}
+      # Set before accept refuses the findings, so check-finish can say so.
+      rejected: ${{ steps.accept.outputs.rejected }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -2505,6 +2531,58 @@ jobs:
           bash "$hp" check "$out" --head "$GATE_HEAD"
           echo "line=Host records: $out" >> "$GITHUB_OUTPUT"
 
+      # Full or incremental, decided by the pinned host pass from the App's own pofix review
+      # check runs on the pull request's commits and nothing the pull request controls
+      # (host-pass.md, Incremental Review). The App is matched by the numeric id of the check
+      # run check-start made; without one the review is full. A full review asked for with
+      # the full command is full. The decision, its reason and the counts go to the job
+      # summary. On an incremental review the four task lines are written into the records,
+      # which are checked again; a refused input or a failed write fails the job.
+      - name: Decide full or incremental review
+        id: prior
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+          CHECK_RUN_ID: ${{ needs.check-start.outputs.check_run_id }}
+          FULL_REQUESTED: ${{ needs.gate.outputs.full_requested }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          refs="$RUNNER_TEMP/pofix-agent/.agents/skills"
+          hp="$refs/terraform-module-pr-review/references/host-pass.sh"
+          records="$RUNNER_TEMP/pofix-host-records"
+          out="$RUNNER_TEMP/pofix-prior"
+          mb="$(jq -r '.merge_base // ""' "$records/host.json")"
+          prefix="$(jq -r '.prefix' "$records/host.json")"
+          base_ref="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref')"
+          [[ "$base_ref" =~ ^[A-Za-z0-9._/-]{1,255}$ ]] || fail "unexpected base branch name"
+          facts=none
+          if [ -f "$RUNNER_TEMP/pofix-schema-facts/versions.json" ]; then
+            facts="$(sha256sum < "$RUNNER_TEMP/pofix-schema-facts/versions.json" | cut -d' ' -f1)"
+          fi
+          force=()
+          [ "$FULL_REQUESTED" != true ] || force=(--force-full requested)
+          app=""
+          if [[ "$CHECK_RUN_ID" =~ ^[1-9][0-9]*$ ]]; then
+            app="$(gh api "repos/$REPOSITORY/check-runs/$CHECK_RUN_ID" --jq '.app.id' 2> /dev/null || true)"
+          fi
+          if ! [[ "$app" =~ ^[1-9][0-9]{0,15}$ ]]; then app=1; force=(--force-full no-own-check); fi
+          [[ "$mb" =~ ^[0-9a-f]{40}$ ]] || { mb=0000000000000000000000000000000000000000; force=(--force-full no-merge-base); }
+          bash "$hp" prior --repo "$REPOSITORY" --pr "$PR_NUMBER" --head "$GATE_HEAD" --base-ref "$base_ref" \
+            --merge-base "$mb" --prefix "$prefix" --skills "$SKILLS_SHA" --facts "$facts" --verify "$VERIFY_SETUP" \
+            --app-id "$app" --rules "$refs/terraform-module-reviewer/references/rule-facts.md" --now "$(date -u +%s)" \
+            --out "$out" ${force[@]+"${force[@]}"} | tee -a "$GITHUB_STEP_SUMMARY"
+          bash "$hp" check-prior "$out" --head "$GATE_HEAD" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash "$hp" incremental --records "$records" --prior "$out" | tee -a "$GITHUB_STEP_SUMMARY"
+          bash "$hp" check "$records" --head "$GATE_HEAD"
+          jq -r '"prior metrics: \(.metrics.commits) commits, \(.metrics.pages) pages, \(.metrics.changed_since) of \(.metrics.changed_total) changed lines"' \
+            "$out/meta.json" | tee -a "$GITHUB_STEP_SUMMARY"
+          jq -r '"mode=\(.mode)", "depth=\(.depth)", "last_full=\(.last_full)"' "$out/meta.json" >> "$GITHUB_OUTPUT"
+          { echo "base_ref=$base_ref"; echo "merge_base=$mb"; echo "facts=$facts"; } >> "$GITHUB_OUTPUT"
+
       # The AWS credentials exist only from this step on, for the model calls to Bedrock.
       # Two layers below keep them from the agent, neither covering everything alone:
       # sandbox.credentials unsets them for sandboxed Bash only; the Read deny rules and
@@ -2685,19 +2763,21 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          expected="comment.md result.json "
-          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output is not exactly comment.md and result.json"
+          expected="comment.md findings.json result.json "
+          [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output is not exactly comment.md, findings.json and result.json"
           [ "$(find "$OUT" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the review output holds a link or a special file"
           [ -s "$OUT/comment.md" ] || fail "comment.md is empty"
           jq -e --arg target "$REPOSITORY#$PR_NUMBER" --argjson number "$PR_NUMBER" "$RESULT_CONTRACT" "$OUT/result.json" > /dev/null || fail "result.json does not match the contract"
-          if grep -qE -- "$LEAK_PATTERN" "$OUT/comment.md" "$OUT/result.json"; then fail "the review output matches a leak pattern"; fi
+          [ "$(wc -c < "$OUT/findings.json")" -le 1048576 ] || fail "findings.json is over 1 MiB"
+          jq -e "$FINDINGS_CONTRACT" "$OUT/findings.json" > /dev/null || fail "findings.json does not match the contract"
+          if grep -qE -- "$LEAK_PATTERN" "$OUT/comment.md" "$OUT/findings.json" "$OUT/result.json"; then fail "the review output matches a leak pattern"; fi
           if grep -qF -- "pofix-review:" "$OUT/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
           [ "$(wc -c < "$OUT/comment.md")" -le 65000 ] || fail "comment.md is too large to post"
           mkdir "$STAGE"
-          cp -- "$OUT/comment.md" "$OUT/result.json" "$STAGE/"
+          cp -- "$OUT/comment.md" "$OUT/findings.json" "$OUT/result.json" "$STAGE/"
           # Again on the staged copies, in case a file changed between the check and the cp.
-          [ "$(find "$STAGE" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the staged output is not two regular files"
-          if grep -qE -- "$LEAK_PATTERN" "$STAGE/comment.md" "$STAGE/result.json"; then fail "the staged output matches a leak pattern"; fi
+          [ "$(find "$STAGE" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the staged output is not three regular files"
+          if grep -qE -- "$LEAK_PATTERN" "$STAGE/comment.md" "$STAGE/findings.json" "$STAGE/result.json"; then fail "the staged output matches a leak pattern"; fi
           if grep -qF -- "pofix-review:" "$STAGE/comment.md"; then fail "comment.md carries the dedupe marker prefix"; fi
           # The literal values, and their plain base64, of the secrets this job holds. The
           # values are masked in the log already and are never printed here. A secret
@@ -2707,10 +2787,32 @@ jobs:
             value="${!name:-}"
             [ -n "$value" ] || continue
             encoded="$(printf '%s' "$value" | base64 -w0)"
-            if grep -qF -e "$value" -e "$encoded" "$STAGE/comment.md" "$STAGE/result.json"; then
+            if grep -qF -e "$value" -e "$encoded" "$STAGE/comment.md" "$STAGE/findings.json" "$STAGE/result.json"; then
               fail "the staged output contains the value of $name"
             fi
           done
+
+      # The host's own check of the findings, after the model and before anything leaves the
+      # runner (host-pass.md, Incremental Review): after an incremental prior, every carried
+      # finding unchanged and once, every other finding inside the scope or a never rule,
+      # and the verdict the one the findings give. A refusal fails closed: nothing is
+      # uploaded or posted, and check-finish completes the check run as neutral.
+      - name: Accept the findings
+        id: accept
+        env:
+          STAGE: ${{ runner.temp }}/pofix-upload
+        run: |
+          set -euo pipefail
+          refs="$RUNNER_TEMP/pofix-agent/.agents/skills"
+          if ! answer="$(bash "$refs/terraform-module-pr-review/references/host-pass.sh" accept --prior "$RUNNER_TEMP/pofix-prior" \
+              --findings "$STAGE/findings.json" --result "$STAGE/result.json" \
+              --rules "$refs/terraform-module-reviewer/references/rule-facts.md")"; then
+            echo "rejected=true" >> "$GITHUB_OUTPUT"
+            echo "fail closed: $answer" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "::error::$answer"
+            exit 1
+          fi
+          echo "$answer" | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the review output
         id: upload-review
@@ -2795,10 +2897,12 @@ jobs:
         run: |
           set -euo pipefail
           fail() { echo "::error::$1"; exit 1; }
-          expected="comment.md result.json "
+          expected="comment.md findings.json result.json "
           [ "$(find "$IN" -mindepth 1 -maxdepth 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "unexpected files in the artifact"
           [ "$(find "$IN" -mindepth 1 -maxdepth 1 -type f -links 1 -printf "%f\n" | sort | tr '\n' ' ')" = "$expected" ] || fail "the artifact holds a link or a special file"
           jq -e --arg target "$REPOSITORY#$PR_NUMBER" --argjson number "$PR_NUMBER" "$RESULT_CONTRACT" "$IN/result.json" > /dev/null || fail "result.json does not match the contract"
+          [ "$(wc -c < "$IN/findings.json")" -le 1048576 ] || fail "findings.json is over 1 MiB"
+          jq -e "$FINDINGS_CONTRACT" "$IN/findings.json" > /dev/null || fail "findings.json does not match the contract"
           [ -s "$IN/comment.md" ] || fail "comment.md is empty"
 
       - name: Mint the write token
@@ -2960,9 +3064,62 @@ jobs:
           repositories: ${{ github.event.repository.name }}
           permission-checks: write
 
+      # The pinned host pass, for the record below. Fetched by SHA like the review's copy.
+      - name: Download the pinned skills for the record
+        if: steps.post.outputs.review_url != '' && needs.check-start.outputs.check_run_id != '' && needs.gate.outputs.stage0 == 'pass' && needs.review.result == 'success'
+        continue-on-error: true
+        env:
+          SKILLS_REPOSITORY: ${{ needs.gate.outputs.skills_repository }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/pofix-agent"
+          git init -q "$dest"
+          git -C "$dest" -c core.hooksPath=/dev/null fetch -q --depth 1 --no-tags "https://github.com/$SKILLS_REPOSITORY.git" "$SKILLS_SHA"
+          git -C "$dest" -c core.hooksPath=/dev/null -c advice.detachedHead=false checkout -q --detach FETCH_HEAD
+          [ "$(git -C "$dest" rev-parse HEAD)" = "$SKILLS_SHA" ] || { echo "::error::$SKILLS_REPOSITORY is not at $SKILLS_SHA"; exit 1; }
+
+      # The record for the next review, only after a full stage: the head, the base branch
+      # and the merge base are read again and must be the ones the review used, and every
+      # field is checked against its pattern by record, which writes no record at all when
+      # it would not fit (host-pass.md, Incremental Review). Any fault leaves the record out;
+      # the check run is still completed below.
+      - name: Write the record for the next review
+        id: record
+        if: steps.post.outputs.review_url != '' && needs.check-start.outputs.check_run_id != '' && needs.gate.outputs.stage0 == 'pass' && needs.review.result == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IN: ${{ runner.temp }}/pofix-in
+          REPOSITORY: ${{ needs.gate.outputs.repository }}
+          PR_NUMBER: ${{ needs.gate.outputs.pr_number }}
+          GATE_HEAD: ${{ needs.gate.outputs.head_sha }}
+          SKILLS_SHA: ${{ needs.gate.outputs.skills_sha }}
+          MODE: ${{ needs.review.outputs.mode }}
+          DEPTH: ${{ needs.review.outputs.depth }}
+          LAST_FULL: ${{ needs.review.outputs.last_full }}
+          BASE_REF: ${{ needs.review.outputs.base_ref }}
+          MERGE_BASE: ${{ needs.review.outputs.merge_base }}
+          FACTS: ${{ needs.review.outputs.facts }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          [[ "$MODE" =~ ^(full|incremental)$ && "$DEPTH" =~ ^[0-5]$ ]] || fail "unexpected mode or depth"
+          [[ "$MERGE_BASE" =~ ^[0-9a-f]{40}$ && "$BASE_REF" =~ ^[A-Za-z0-9._/-]{1,255}$ ]] || fail "unexpected base"
+          meta="$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER" --jq '[.head.sha, .base.ref, .base.sha] | join(" ")')"
+          read -r head ref base <<< "$meta"
+          [ "$head" = "$GATE_HEAD" ] && [ "$ref" = "$BASE_REF" ] || fail "the head or the base branch moved; no record"
+          mb="$(gh api "repos/$REPOSITORY/compare/$base...$head" --jq '.merge_base_commit.sha')"
+          [ "$mb" = "$MERGE_BASE" ] || fail "the merge base moved; no record"
+          bash "$RUNNER_TEMP/pofix-agent/.agents/skills/terraform-module-pr-review/references/host-pass.sh" record \
+            --repo "$REPOSITORY" --pr "$PR_NUMBER" --head "$GATE_HEAD" --base-ref "$BASE_REF" --merge-base "$MERGE_BASE" \
+            --skills "$SKILLS_SHA" --facts "$FACTS" --verify "$VERIFY_SETUP" --mode "$MODE" --depth "$DEPTH" \
+            --last-full "$LAST_FULL" --findings "$IN/findings.json" --out "$RUNNER_TEMP/pofix-record.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
       # The conclusion is a fixed function of the verdict, of the triage when it was the
       # last stage, of the full review otherwise. The check text holds only the verdict,
-      # the stage, the review URL and the SHAs, nothing from the comment body.
+      # the stage, the review URL and the SHAs, nothing from the comment body, and after a
+      # full stage the record the step above wrote, if any.
       - name: Complete the check run
         if: steps.post.outputs.review_url != '' && needs.check-start.outputs.check_run_id != '' && needs.gate.outputs.stage0 == 'pass'
         continue-on-error: true
@@ -2979,14 +3136,17 @@ jobs:
           fail() { echo "::error::$1"; exit 1; }
           [[ "$CHECK_RUN_ID" =~ ^[1-9][0-9]*$ ]] || fail "unexpected check run id"
           [[ "$REVIEW_URL" =~ ^https://[A-Za-z0-9.-]+/[^[:space:]]+$ ]] || fail "unexpected review URL"
-          jq --arg url "$REVIEW_URL" --arg skills "$SKILLS_SHA" --arg stage "$FINAL_STAGE" '
+          record="$RUNNER_TEMP/pofix-record.txt"
+          [ -f "$record" ] && [ ! -L "$record" ] || { record="$RUNNER_TEMP/pofix-no-record"; : > "$record"; }
+          jq --arg url "$REVIEW_URL" --arg skills "$SKILLS_SHA" --arg stage "$FINAL_STAGE" --rawfile record "$record" '
             {"approve": "success", "approve with nits": "success",
              "block": "failure", "hold for the next major": "failure",
              "changes suggested": "neutral", "inconclusive": "neutral"} as $map
             | ($map[.verdict] // error("unknown verdict")) as $conclusion
             | {status: "completed", conclusion: $conclusion,
-               output: {title: ("pofix: " + .verdict + (if $stage == "triage" then " (triage)" else "" end)),
-                        summary: ("Review: \($url)\n\nStage: \($stage). Head \(.head_sha), base \(.base_sha), pofix-agent \($skills).")}}
+               output: ({title: ("pofix: " + .verdict + (if $stage == "triage" then " (triage)" else "" end)),
+                        summary: ("Review: \($url)\n\nStage: \($stage). Head \(.head_sha), base \(.base_sha), pofix-agent \($skills).")}
+                       + (if $record == "" then {} else {text: $record} end))}
           ' "$IN/result.json" |
             gh api --method PATCH "repos/$REPOSITORY/check-runs/$CHECK_RUN_ID" --input - > /dev/null
 
@@ -3024,6 +3184,7 @@ jobs:
           TRIAGE_RESULT: ${{ needs.triage.result }}
           STAGE2: ${{ needs.triage.outputs.stage2 }}
           REVIEW_RESULT: ${{ needs.review.result }}
+          REVIEW_REJECTED: ${{ needs.review.outputs.rejected }}
           POST_RESULT: ${{ needs.post.result }}
           POSTED_URL: ${{ needs.post.outputs.posted_url }}
           ALREADY_POSTED_URL: ${{ needs.post.outputs.already_posted_url }}
@@ -3056,6 +3217,9 @@ jobs:
             fi
           elif [ "$HEAD_MOVED" = "true" ]; then
             reason="The pull request head moved after the request. Nothing was reviewed."
+          elif [ "$stage" = "review" ] && [ "$REVIEW_REJECTED" = "true" ]; then
+            title="pofix: incremental review refused"
+            reason="The incremental review did not keep its carried findings, its scope or its verdict, so nothing was posted. Comment \`@pofix full\` for a full review."
           elif [ "$stage" = "review" ] && [ "$VERIFY_RESULT" = "cancelled" ]; then
             reason="The verify job was cancelled. Nothing was reviewed."
           elif [ "$stage_result" != "success" ]; then

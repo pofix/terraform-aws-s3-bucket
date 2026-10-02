@@ -5,7 +5,7 @@
 #   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
 #   master        the 40-hex commit of that repository to run pr-review.yml from
 #   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
-#   c6d5f6085ad249145ff61596a83da8b50206b788          the 40-hex commit of the skills to run
+#   5b5726a4808fc66c8b585ffcf5cb0e87d466acbd          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
 # which explains how to pin and upgrade both SHAs. One of them is the organization
 # variable POFIX_MAINTAINERS, the maintainer allowlist: only a user it lists starts a run.
@@ -64,7 +64,7 @@ jobs:
     uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@master
     with:
       skills_repository: pofix/pofix-skills
-      skills_sha: c6d5f6085ad249145ff61596a83da8b50206b788
+      skills_sha: 5b5726a4808fc66c8b585ffcf5cb0e87d466acbd
       # The maintainer allowlist, passed explicitly so the value the gate checks is visible
       # here, in the caller, rather than read from the caller's context.
       maintainers: ${{ vars.POFIX_MAINTAINERS }}
