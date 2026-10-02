@@ -1,7 +1,7 @@
-# Pofix schema page cache: the warm workflow for one module repository. Optional.
+# modulestf schema page cache: the warm workflow for one module repository. Optional.
 #
 # A template to copy, not a live workflow. Copy it into each module repository that runs
-# the review as .github/workflows/pofix-schema-cache.yml. It has no placeholder to fill.
+# the review as .github/workflows/modulestf-schema-cache.yml. It has no placeholder to fill.
 #
 # It is the only writer of the schema page cache the review reads. It runs only on
 # schedule and workflow_dispatch, only on the default branch, with contents: read and
@@ -14,7 +14,7 @@
 #
 # Items marked [verify] are assumptions the live pilot must confirm.
 
-name: pofix schema page cache
+name: modulestf schema page cache
 
 on:
   schedule:
@@ -36,7 +36,7 @@ jobs:
     # Save only: the platform refuses a restore in this job, so no page outlives a run.
     cache-mode: write-only
     concurrency:
-      group: pofix-schema-cache-${{ github.repository }}
+      group: modulestf-schema-cache-${{ github.repository }}
       cancel-in-progress: false
     env:
       # The same pattern as in pr-review.yml.template; tests/ci-workflow-test.sh keeps
@@ -69,8 +69,8 @@ jobs:
         run: |
           set -uo pipefail
           set -f
-          save="$RUNNER_TEMP/pofix-schema-stored"
-          work="$RUNNER_TEMP/pofix-schema-work"
+          save="$RUNNER_TEMP/modulestf-schema-stored"
+          work="$RUNNER_TEMP/modulestf-schema-work"
           mkdir "$save" "$work" || exit 1
           reg() { curl -fsS -g --proto '=https' --max-time 30 --max-filesize 50000000 "https://registry.terraform.io/$1"; }
           name_re='^[a-z0-9][a-z0-9-]{0,63}$'
@@ -134,5 +134,5 @@ jobs:
         if: steps.pages.outputs.pages != '' && steps.pages.outputs.pages != '0'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ${{ runner.temp }}/pofix-schema-stored
-          key: pofix-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/modulestf-schema-stored
+          key: modulestf-schema-pages-v1-${{ github.run_id }}-${{ github.run_attempt }}

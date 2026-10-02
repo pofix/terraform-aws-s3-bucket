@@ -1,34 +1,34 @@
-# Pofix pull request review: the caller for one module repository.
+# modulestf pull request review: the caller for one module repository.
 #
 # A template to copy, not a live workflow. Copy it into each module repository as
-# .github/workflows/pofix-review.yml, then replace the placeholders:
-#   pofix/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
+# .github/workflows/modulestf-review.yml, then replace the placeholders:
+#   modulestf/terraform-aws-s3-bucket  owner/name of the repository holding pr-review.yml
 #   master        the default branch of that repository, for example master:
 #                           pr-review.yml runs from the tip of that branch
-#   pofix/pofix-skills   owner/name of the repository holding the pofix-agent skills
-#   c17ef22fa8135af2f06f87e83f8138912d7d5239          the 40-hex commit of the skills to run
+#   modulestf/skills   owner/name of the repository holding the modulestf skills
+#   b47c440f673dcae75903a92a6c3f43f808906d8c          the 40-hex commit of the skills to run
 # The repository also needs the secret and variables listed in ci/github/README.md,
 # which explains the workflow ref, the skills SHA and how to upgrade each. One of them
-# is the organization variable POFIX_MAINTAINERS, the maintainer allowlist: only a user
+# is the organization variable MODULESTF_MAINTAINERS, the maintainer allowlist: only a user
 # it lists starts a run.
 #
 # GitHub reads this file from the default branch for issue_comment and pull_request_target
-# events, so a pull request cannot change it. A comment containing "@pofix" on a pull
+# events, so a pull request cannot change it. A comment containing "@modulestf" on a pull
 # request starts a run; the reusable workflow checks who wrote it before anything else
-# happens. A comment containing "@pofix full" asks for the full review at once, without the
-# triage first. A comment that starts with `@pofix plan` asks for the full review with a
+# happens. A comment containing "@modulestf full" asks for the full review at once, without the
+# triage first. A comment that starts with `@modulestf plan` asks for the full review with a
 # credentialed plan pass; the plan job's OIDC token comes from the id-token grant below.
-# The pofix-review label starts a run when it is added and on each push while
+# The modulestf-review label starts a run when it is added and on each push while
 # it is on the pull request; the reusable workflow checks who added it, and removes a label
 # a user it refuses added. pull_request_target runs with this repository's secrets even for
 # a fork, so no job here or in the reusable workflow checks out the head.
 
-name: pofix pull request review
+name: modulestf pull request review
 # The run's name carries the commenter's user id, set by GitHub, so the gate of later runs
 # can count a maintainer's runs from the run history. A label run's charged user is in its
 # job names instead.
 run-name: >-
-  ${{ github.event_name == 'issue_comment' && format('pofix review (comment, user {0})', github.event.comment.user.id) || 'pofix review (label)' }}
+  ${{ github.event_name == 'issue_comment' && format('modulestf review (comment, user {0})', github.event.comment.user.id) || 'modulestf review (label)' }}
 
 on:
   issue_comment:
@@ -39,25 +39,25 @@ on:
 permissions: {}
 
 jobs:
-  pofix:
+  modulestf:
     # The comment body is read only in this if: and in if: conditions of the reusable
     # workflow's gate job. Another label, or a push to a pull request without the label,
     # starts nothing.
     if: >-
       (github.event_name == 'issue_comment' &&
       github.event.issue.pull_request &&
-      contains(github.event.comment.body, '@pofix') &&
+      contains(github.event.comment.body, '@modulestf') &&
       github.event.comment.user.type == 'User') ||
       (github.event_name == 'pull_request_target' &&
-      ((github.event.action == 'labeled' && github.event.label.name == 'pofix-review') ||
-      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'pofix-review'))))
+      ((github.event.action == 'labeled' && github.event.label.name == 'modulestf-review') ||
+      (github.event.action == 'synchronize' && contains(github.event.pull_request.labels.*.name, 'modulestf-review'))))
     # A new push cancels the label run in progress on the same pull request. A comment run
     # is in a group of its own, so a push never cancels it or replaces it.
     concurrency:
       group: >-
         ${{ github.event_name == 'pull_request_target'
-        && format('pofix-label-{0}-{1}', github.repository, github.event.pull_request.number)
-        || format('pofix-comment-{0}', github.run_id) }}
+        && format('modulestf-label-{0}-{1}', github.repository, github.event.pull_request.number)
+        || format('modulestf-comment-{0}', github.run_id) }}
       cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
     permissions:
       contents: read
@@ -65,12 +65,12 @@ jobs:
       id-token: write
       # Only the reusable workflow's stop job asks for it, to cancel label runs.
       actions: write
-    uses: pofix/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@master
+    uses: modulestf/terraform-aws-s3-bucket/.github/workflows/pr-review.yml@master
     with:
-      skills_repository: pofix/pofix-skills
-      skills_sha: c17ef22fa8135af2f06f87e83f8138912d7d5239
+      skills_repository: modulestf/skills
+      skills_sha: b47c440f673dcae75903a92a6c3f43f808906d8c
       # The maintainer allowlist, passed explicitly so the value the gate checks is visible
       # here, in the caller, rather than read from the caller's context.
-      maintainers: ${{ vars.POFIX_MAINTAINERS }}
+      maintainers: ${{ vars.MODULESTF_MAINTAINERS }}
     secrets:
-      POFIX_APP_PRIVATE_KEY: ${{ secrets.POFIX_APP_PRIVATE_KEY }}
+      MODULESTF_APP_PRIVATE_KEY: ${{ secrets.MODULESTF_APP_PRIVATE_KEY }}
